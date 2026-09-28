@@ -1,0 +1,651 @@
+---
+title: "Middleware and Proxy"
+category: "nextjs"
+subcategory: "performance-primitives"
+order: 99
+---
+
+# Middleware and Proxy
+
+## Exploring how Next.js runs code before a request is completed, and why it is a first filter and not your only defense
+
+### 1. The Problem
+
+Some decisions about what to send a user are easiest to make before any page renders. Authentication redirects, A/B test assignment, locale or region routing, bot detection, and request header changes all need to see the request before it reaches a page or a Route Handler.
+
+Without a place to intercept requests, these decisions live inside the pages themselves. A protected route checks the session at the top of its component. If the user is not signed in, it redirects. That works, but the route's code has already started to run before the redirect is issued. And with many protected routes, the same check is repeated across dozens of files. A change to the authentication logic means finding every copy, and a missed one is a security hole.
+
+Next.js has a feature for this: code that runs before a request is completed. It can rewrite the request to a different route, redirect it, change request or response headers, or respond directly.
+
+**A note on names.** In Next.js 15 and earlier this feature was called **Middleware** and lived in `middleware.js`. Starting with Next.js 16 it is called **Proxy** and lives in `proxy.js`. The Next.js team renamed it because "middleware" is easily confused with Express.js middleware, and because the word "proxy" better describes a boundary in front of your application. The idea is the same, but a few defaults changed, so this lesson uses Proxy and points out where Middleware differed.
+
+| | Middleware (Next.js 15 and earlier) | Proxy (Next.js 16 and later) |
+| --- | --- | --- |
+| File | `middleware.js` (or `.ts`) | `proxy.js` (or `.ts`) |
+| Exported function | `middleware` | `proxy` |
+| Default runtime | Edge | Node.js |
+| Edge runtime | Supported | Not supported |
+| Node.js runtime | Opt-in: experimental in 15.2, stable in 15.5 | The default, and it cannot be configured |
+| Status | Deprecated in 16 | Current |
+
+If you need the Edge runtime in Next.js 16, the documentation says to keep using `middleware`. To migrate, Next.js provides a codemod (`npx @next/codemod@canary middleware-to-proxy .`) that renames the file and the function.
+
+It also works in both routers. Proxy sits at the same level as the `app` or `pages` directory and applies to routes served by either. The only router-specific details are that the matcher's `locale` option relates to Pages Router internationalization, and that Pages Router data requests (`/_next/data/...`) also pass through it.
+
+---
+
+### 2. The Naive Attempt
+
+A developer protects their dashboard by checking the session in every layout:
+
+```jsx
+// app/dashboard/layout.js
+import { cookies } from 'next/headers';
+import { redirect } from 'next/navigation';
+import { verifySession } from '@/lib/auth';
+
+export default async function DashboardLayout({ children }) {
+  const cookieStore = await cookies();
+  const sessionToken = cookieStore.get('session')?.value;
+
+  if (!sessionToken) {
+    redirect('/login');
+  }
+
+  const session = await verifySession(sessionToken);
+  if (!session) {
+    redirect('/login');
+  }
+
+  return (
+    <div>
+      <DashboardNav />
+      {children}
+    </div>
+  );
+}
+```
+
+```jsx
+// app/settings/layout.js
+// The same check, copied
+export default async function SettingsLayout({ children }) {
+  const cookieStore = await cookies();
+  const sessionToken = cookieStore.get('session')?.value;
+  if (!sessionToken) redirect('/login');
+
+  const session = await verifySession(sessionToken);
+  if (!session) redirect('/login');
+
+  return <>{children}</>;
+}
+```
+
+This has three problems, and the third is the most serious.
+
+---
+
+### 3. Why That Breaks
+
+**Failure mode 1: authentication logic is scattered.**
+
+Each protected area owns a copy of the check. Adding a new protected area means remembering to add it, and changing the logic (a new session format, a different redirect for different failures) means editing every copy.
+
+**Failure mode 2: a layout check does not run when you think it does.**
+
+Layouts do not re-render when the user navigates between pages that share them. This is called Partial Rendering: the router keeps the layout and only swaps the page. So a session check placed in a layout runs on the first visit, not on every route change. The Next.js authentication guide warns about this directly.
+
+A layout also does not control whether the rest of the route renders. Route segments and parallel route slots are rendered by the router, so a layout that returns nothing for an unauthorized user does not stop the segments below it from running or from appearing in the response. Server Functions are separate entry points as well and are not covered by a layout check at all. The guide calls the SPA habit of returning `null` from a layout when the user is unauthorized "not recommended" for this reason.
+
+**Failure mode 3: work happens before the decision.**
+
+For a request from a signed-out visitor, the route starts to render and verify the session before it discovers there is nothing to show. If verifying the session touches a database, every anonymous request hits the database just to be redirected.
+
+Moving everything into Proxy is not the answer either. The right design uses two layers, described next.
+
+---
+
+### 4. Next.js's Mental Model
+
+Proxy is a function that runs before a matched request is completed. It can read the request (URL, headers, cookies), and then it can let the request continue, rewrite it, redirect it, change its headers, or answer it directly. If it returns nothing special, the request continues as normal.
+
+It runs in its own step, separate from your rendering code. The documentation says it is meant to be invoked separately from your render code and that in optimized cases it is deployed to your CDN for fast redirect and rewrite handling, so you should not rely on shared modules or globals. To pass information from Proxy to your application, use headers, cookies, rewrites, redirects, or the URL.
+
+Proxy is also deliberately limited in purpose:
+
+- It is not meant for slow data fetching. `fetch` options such as `cache`, `next.revalidate`, and `next.tags` have no effect in it.
+- It can be useful for optimistic checks such as permission-based redirects, but the documentation says it should not be used as a full session management or authorization solution.
+- For simple redirects, try the `redirects` option in `next.config` first. Use Proxy when you need request data or more complex logic.
+- The Next.js team recommends avoiding it unless no other option exists, and is working on APIs that make it unnecessary for common cases.
+
+This gives a two-layer model for authentication:
+
+- **Optimistic check, in Proxy:** read the session cookie, and redirect obviously unauthenticated visitors early. No database call.
+- **Secure check, near the data:** a Data Access Layer (DAL) function verifies the session wherever data is read or changed: in pages, Server Components, Server Functions, and Route Handlers.
+
+One sentence: Proxy is a fast, centralized first filter that makes routing decisions before a route runs, and it complements, but never replaces, authorization done close to your data.
+
+---
+
+### 5. Next.js's Solution
+
+**Creating Proxy.**
+
+Create `proxy.js` (or `proxy.ts`) in the project root, or inside `src` if you use one, at the same level as `app` or `pages`. There is one Proxy file per project. It can export a function named `proxy` or a default function, and it can be `async`. To keep it organized, split logic into modules and import them into the one file.
+
+```js
+// proxy.js
+import { NextResponse } from 'next/server';
+
+export function proxy(request) {
+  // request is a NextRequest: URL, headers, cookies, method
+  return NextResponse.redirect(new URL('/home', request.url));
+}
+
+export const config = {
+  matcher: '/about/:path*',
+};
+```
+
+With `NextResponse` you can `redirect` to another URL, `rewrite` to serve a different route under the same URL, set request headers for the route (and for rewrite destinations), set response cookies and headers, or produce a response. `NextResponse.next()` lets the request continue. You can also answer directly by returning a `Response` or `NextResponse`, for example `Response.json({ ... }, { status: 401 })`.
+
+Proxy receives a second argument, a `NextFetchEvent`, whose `waitUntil(promise)` method keeps the invocation alive so background work such as logging can finish after the response is sent:
+
+```js
+export function proxy(request, event) {
+  event.waitUntil(
+    fetch('https://analytics.example.com/log', {
+      method: 'POST',
+      body: JSON.stringify({ pathname: request.nextUrl.pathname }),
+    }),
+  );
+  return NextResponse.next();
+}
+```
+
+**The optimistic check.**
+
+The most common use is the first layer of authentication. Read the session cookie, verify its signature, and redirect visitors who obviously have no session:
+
+```js
+// proxy.js
+import { NextResponse } from 'next/server';
+import { decrypt } from '@/app/lib/session';
+
+const protectedRoutePrefixes = ['/dashboard', '/settings'];
+
+export default async function proxy(request) {
+  const { pathname } = request.nextUrl;
+  const isProtectedRoute = protectedRoutePrefixes.some((prefix) => pathname.startsWith(prefix));
+
+  if (isProtectedRoute) {
+    // Optimistic check: reads the session cookie only, with no database call
+    const sessionCookie = request.cookies.get('session')?.value;
+    const session = await decrypt(sessionCookie);
+
+    if (!session?.userId) {
+      const loginUrl = new URL('/login', request.url);
+      loginUrl.searchParams.set('returnTo', pathname);
+      return NextResponse.redirect(loginUrl);
+    }
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: ['/((?!api|_next/static|_next/image|favicon.ico|sitemap.xml|robots.txt).*)'],
+};
+```
+
+Because Proxy now runs on the Node.js runtime, the libraries it imports must simply be compatible with Node.js. Keep the work stateless: verify a signature, read a cookie. Do not query a database here, because Proxy runs on every matched request, including prefetch requests that `next/link` makes in the background.
+
+**The secure check, near the data.**
+
+The real decision belongs in a Data Access Layer function that every data read and every mutation goes through:
+
+```js
+// app/lib/dal.js
+import 'server-only';
+import { cache } from 'react';
+import { cookies } from 'next/headers';
+import { redirect } from 'next/navigation';
+import { decrypt } from '@/app/lib/session';
+
+export const verifySession = cache(async () => {
+  const sessionCookie = (await cookies()).get('session')?.value;
+  const session = await decrypt(sessionCookie);
+
+  if (!session?.userId) {
+    redirect('/login');
+  }
+
+  // With database sessions, compare the session with the database here: this is the secure check
+  return { isAuth: true, userId: session.userId };
+});
+```
+
+```jsx
+// app/dashboard/page.js
+import { verifySession } from '@/app/lib/dal';
+
+export default async function DashboardPage() {
+  const session = await verifySession();
+  const user = await getUserData(session.userId);
+
+  return <h1>Welcome, {user.name}</h1>;
+}
+```
+
+`cache` from React memoizes the function during one render pass, so calling `verifySession()` from many components costs one check. Call the same function from Server Functions and Route Handlers too. The layout example from section 2 can then keep its job, showing the navigation, while the check happens where the data is read.
+
+One detail on the redirect: the `returnTo` value travels through the URL, so the login handler must treat it as untrusted input. Accept only relative paths on your own site, or the login page becomes an open redirect:
+
+```js
+function getSafeReturnTo(returnTo) {
+  // Only same-site relative paths, never absolute URLs or //host or /\host forms
+  const isRelativePath =
+    typeof returnTo === 'string' &&
+    returnTo.startsWith('/') &&
+    !returnTo.startsWith('//') &&
+    !returnTo.startsWith('/\\');
+  return isRelativePath ? returnTo : '/dashboard';
+}
+```
+
+**Request headers versus response headers.**
+
+Proxy can set headers on the request that your routes see, or on the response that the browser sees. They are easy to mix up:
+
+```js
+import { NextResponse } from 'next/server';
+
+export function proxy(request) {
+  const requestHeaders = new Headers(request.headers);
+  requestHeaders.set('x-hello-from-proxy', 'hello');
+
+  // Request headers: available to your routes and Server Components
+  const response = NextResponse.next({
+    request: { headers: requestHeaders },
+  });
+
+  // Response headers: sent to the browser
+  response.headers.set('x-hello-from-proxy-response', 'hello');
+  return response;
+}
+```
+
+The Next.js documentation is explicit: `NextResponse.next({ request: { headers } })` makes headers available upstream, while `NextResponse.next({ headers })` makes them available to clients. Setting a header on `response.headers` sends it to the browser and does not make it readable by your Server Components.
+
+A related caution: passing the signed-in user's ID to your pages in a header such as `x-user-id` is tempting, but do not treat it as proof of identity. Incoming request headers can be supplied by the client, so a header your code trusts must be overwritten by Proxy on every matched request, and even then the documentation's recommendation stays the same: verify the session near the data with the DAL. Headers are good for non-security context, such as a nonce (below) or a request ID.
+
+**URL rewriting.**
+
+A rewrite changes which route serves the request without changing the URL the user sees. It suits A/B tests and experiments:
+
+```js
+export function proxy(request) {
+  const { pathname } = request.nextUrl;
+
+  if (pathname === '/') {
+    const existingGroup = request.cookies.get('ab-group')?.value;
+    const abGroup = existingGroup ?? (Math.random() > 0.5 ? 'a' : 'b');
+
+    const url = request.nextUrl.clone();
+    url.pathname = `/home-${abGroup}`; // serve /home-a or /home-b
+
+    const response = NextResponse.rewrite(url);
+
+    // Set the cookie on the response so the visitor stays in the same group
+    if (!existingGroup) {
+      response.cookies.set('ab-group', abGroup, {
+        maxAge: 60 * 60 * 24 * 30, // 30 days
+        httpOnly: true,
+        sameSite: 'lax',
+      });
+    }
+
+    return response;
+  }
+
+  return NextResponse.next();
+}
+```
+
+The browser keeps showing `/`. Two page components can be developed independently. Remember that the rewrite destinations, `/home-a` and `/home-b`, are still real routes that anyone can visit directly. The documentation notes the same for rewrite targets and suggests using Proxy to block direct requests if you do not want that.
+
+**Geolocation-based routing (Vercel-specific).**
+
+Location is not part of the standard request, so how you read it depends on the host. The old `request.geo` and `request.ip` properties were removed from `NextRequest` in Next.js 15. On Vercel, use the `geolocation` helper from `@vercel/functions` (the underlying data arrives in headers such as `x-vercel-ip-country`). Other hosts expose location differently, so check your host's documentation.
+
+```js
+// proxy.js (Vercel deployments)
+import { NextResponse } from 'next/server';
+import { geolocation } from '@vercel/functions';
+
+export function proxy(request) {
+  // country is undefined outside Vercel, for example on your own machine
+  const { country = 'US' } = geolocation(request);
+
+  if (request.nextUrl.pathname === '/pricing') {
+    if (country === 'GB') {
+      return NextResponse.rewrite(new URL('/pricing-gbp', request.url));
+    }
+    if (country === 'DE') {
+      return NextResponse.rewrite(new URL('/pricing-eur', request.url));
+    }
+  }
+
+  return NextResponse.next();
+}
+```
+
+When the same URL returns different content per region, make sure anything that caches those responses (your host, a CDN) accounts for the input you vary on, or one region's version can be served to another.
+
+**Security headers and Content Security Policy.**
+
+Headers that are the same for every response do not need Proxy at all. Set them in `next.config.js`, whose `headers` run before Proxy in the request order:
+
+```js
+// next.config.js
+module.exports = {
+  async headers() {
+    return [
+      {
+        source: '/(.*)',
+        headers: [
+          { key: 'X-Frame-Options', value: 'DENY' },
+          { key: 'X-Content-Type-Options', value: 'nosniff' },
+          { key: 'Strict-Transport-Security', value: 'max-age=31536000; includeSubDomains' },
+        ],
+      },
+    ];
+  },
+};
+```
+
+Proxy earns its place when a header must be different on every request, and the classic case is a Content Security Policy with a nonce. A nonce is a random value that must be fresh for each request, so it cannot be a static header. Avoid `'unsafe-inline'` for scripts, which weakens CSP. The documented pattern generates a nonce in Proxy, puts it on the request (so Next.js can apply it) and the policy on both the request and the response:
+
+```js
+// proxy.js
+import { NextResponse } from 'next/server';
+
+export function proxy(request) {
+  const nonce = Buffer.from(crypto.randomUUID()).toString('base64');
+  const isDev = process.env.NODE_ENV === 'development';
+
+  const cspHeader = `
+    default-src 'self';
+    script-src 'self' 'nonce-${nonce}' 'strict-dynamic'${isDev ? " 'unsafe-eval'" : ''};
+    style-src 'self' 'nonce-${nonce}';
+    img-src 'self' blob: data:;
+    font-src 'self';
+    object-src 'none';
+    base-uri 'self';
+    form-action 'self';
+    frame-ancestors 'none';
+    upgrade-insecure-requests;
+  `;
+  const cspHeaderValue = cspHeader.replace(/\s{2,}/g, ' ').trim();
+
+  const requestHeaders = new Headers(request.headers);
+  requestHeaders.set('x-nonce', nonce);
+  requestHeaders.set('Content-Security-Policy', cspHeaderValue);
+
+  const response = NextResponse.next({ request: { headers: requestHeaders } });
+  response.headers.set('Content-Security-Policy', cspHeaderValue);
+  return response;
+}
+```
+
+Nonces come with a real cost. Pages must be rendered dynamically on every request, which disables static optimization and Incremental Static Regeneration, prevents CDN caching by default, and is incompatible with Partial Prerendering. If that cost is too high, the documentation offers an experimental alternative, Subresource Integrity, which keeps static generation, and it also shows a version of the policy without nonces set from `next.config.js`.
+
+**The `matcher` configuration.**
+
+Without a `matcher`, Proxy runs on every request, including static files under `_next/static`, image optimization requests under `_next/image`, and files in the `public/` folder. A redirect that is right for pages can then block CSS, JavaScript, or images from loading. The `matcher` option limits where Proxy runs:
+
+```js
+export const config = {
+  matcher: [
+    // Specific paths and patterns
+    '/dashboard/:path*',
+    '/settings/:path*',
+  ],
+};
+```
+
+A negative match runs Proxy everywhere except the excluded paths, which is the usual shape for authentication:
+
+```js
+export const config = {
+  matcher: [
+    // Everything except API routes, static files, image optimization, and metadata files
+    '/((?!api|_next/static|_next/image|favicon.ico|sitemap.xml|robots.txt).*)',
+  ],
+};
+```
+
+Rules from the documentation:
+
+| Rule | Detail |
+| --- | --- |
+| Values must be constants | They are analyzed at build time, and dynamic values are ignored |
+| Paths must start with `/` | `source` patterns are anchored to the start of the path |
+| Named parameters | `/about/:path` matches `/about/a` but not `/about/a/c` |
+| Modifiers | `*` zero or more, `?` zero or one, `+` one or more |
+| Regular expressions | Allowed in parentheses, as in `/about/(.*)` |
+| `has` and `missing` | Conditions on headers, query parameters, or cookies |
+| `locale` | Set to `false` to ignore locale-based routing in matching |
+
+```js
+export const config = {
+  matcher: [
+    {
+      source: '/api/:path*',
+      has: [{ type: 'header', key: 'authorization' }],
+      missing: [{ type: 'cookie', key: 'session', value: 'active' }],
+    },
+  ],
+};
+```
+
+Two behaviors to know. Proxy also runs for the prefetch requests that `next/link` makes, which is why it must stay cheap, and the documentation shows a matcher that uses `missing` conditions on the prefetch headers to skip them when you do not need them. And even if you exclude `_next/data` in a negative matcher, Proxy is still invoked for those routes. That is deliberate: it prevents protecting a page but forgetting its data route.
+
+---
+
+### 6. Internals
+
+**The runtime.**
+
+Proxy defaults to the Node.js runtime, and the `runtime` config option is not available in Proxy files: setting it throws an error. Full Node.js APIs are available to the code you write there, as long as the libraries are compatible.
+
+Before Next.js 16, Middleware defaulted to the Edge runtime, a restricted environment built on Web Platform APIs (`fetch`, `Request`, `Response`, `URL`, Web Crypto) without Node.js built-ins such as `fs` or `child_process`, which ruled out many database drivers and heavy libraries. Node.js support for Middleware arrived as experimental in 15.2 and stable in 15.5. If you keep `middleware.js` to stay on the Edge runtime, those restrictions still apply to it.
+
+**Where it runs.**
+
+Do not assume a particular network location. Proxy runs before your routes are rendered, and how it is deployed depends on the platform:
+
+| Deployment | Supported |
+| --- | --- |
+| Node.js server | Yes |
+| Docker container | Yes |
+| Static export | No |
+| Adapters | Platform-specific |
+
+When you self-host, Proxy runs in your Next.js server before routing. Some platforms may run it closer to the user in optimized cases, but the framework does not promise that, so avoid designing around a specific latency. Check your host's documentation for the details.
+
+**Execution order.**
+
+For every request, Next.js processes these steps in order, and Proxy runs for every matched route in your project:
+
+1. `headers` from `next.config.js`
+2. `redirects` from `next.config.js`
+3. Proxy (`rewrites`, `redirects`, and so on)
+4. `beforeFiles` rewrites from `next.config.js`
+5. Filesystem routes (`public/`, `_next/static/`, `pages/`, `app/`)
+6. `afterFiles` rewrites from `next.config.js`
+7. Dynamic routes (`/blog/[slug]`)
+8. `fallback` rewrites from `next.config.js`
+
+If Proxy answers the request with a redirect or a response, the later steps never run. If it calls `NextResponse.next()` the request continues to the routes.
+
+**Server Functions and the matcher.**
+
+Server Functions are not separate routes in this chain. They are `POST` requests to the route where they are used. So a matcher that excludes a path also skips Proxy for Server Function calls on that path, and a refactor that moves a function to a different route can silently remove its Proxy coverage. This is why every Server Function must verify authentication and authorization itself.
+
+**Prefetches and internal headers.**
+
+Because Proxy runs on prefetch requests, expensive work multiplies. During React Server Component (RSC) requests, Next.js removes internal Flight headers such as `rsc`, `next-router-state-tree`, and `next-router-prefetch` from `request.headers`, so that RSC and HTML requests are handled alike. `NextResponse.rewrite()` propagates the required headers for you. If you implement a rewrite with `fetch()` instead, you must forward them yourself, or enable `skipProxyUrlNormalize` in `next.config.js`.
+
+**Rewrite versus redirect.**
+
+`NextResponse.redirect(url)` returns an HTTP redirect (307 by default). The browser receives it and makes a new request to the destination, so there are two requests and the address bar changes.
+
+`NextResponse.rewrite(url)` returns nothing to the browser as a redirect. The server serves the destination route internally, in one request, and the address bar keeps the original URL.
+
+```
+Redirect:
+  Browser requests /pricing  -> Proxy answers 307 to /pricing-gbp
+  Browser requests /pricing-gbp -> route renders -> response
+  Two requests, and the URL becomes /pricing-gbp
+
+Rewrite:
+  Browser requests /pricing -> Proxy rewrites to /pricing-gbp -> route renders -> response
+  One request, and the URL stays /pricing
+```
+
+Use a redirect when the URL change is meaningful (sending a signed-out visitor to the login page). Use a rewrite when the URL should stay the same but different content should be served (experiments, regional variants, legacy URLs).
+
+**Why Proxy cannot be your only defense.**
+
+In March 2025 the Next.js team disclosed CVE-2025-29927, rated critical (CVSS 9.1). Middleware used an internal header, `x-middleware-subrequest`, to avoid running itself in an infinite loop. Because the framework trusted that header when it arrived from outside, an attacker could send it on a request and skip Middleware entirely, including any authentication or authorization it did. Next.js released fixes in 12.3.5, 13.5.9, 14.2.25, and 15.2.3. Where a patch was not available, the mitigation was to block external requests that carry that header before they reach the application.
+
+The lesson is architectural. An access control that lives in only one layer disappears when that layer is bypassed, misconfigured by a matcher change, or does not cover a Server Function. That is why the optimistic check in Proxy is paired with a secure check near the data, and why keeping Next.js up to date matters for security.
+
+---
+
+### 7. Interview Traps
+
+<Question>
+**Trap 1: A developer puts a database query in Proxy to check whether a user's account is active, and forwards the result to pages in an `x-user-status` header. What is wrong with this, and what is the right architecture?**
+</Question>
+
+<Answer>
+Several things are wrong, and the failing import is not the main one. In Next.js 15 and earlier, Middleware ran on the Edge runtime by default, where common database drivers do not work because they need Node.js built-ins. That objection largely disappears in Next.js 16, where Proxy runs on Node.js, so the query may run. It is still the wrong place for it.
+
+First, Proxy runs on every matched request, including the prefetch requests that `next/link` sends in the background. A database call there is repeated on all of them. The Next.js documentation says Proxy is not intended for slow data fetching and advises reading only the session cookie there.
+
+Second, Proxy is not an authorization layer. The documentation says it can help with optimistic checks but should not be used as a full session management or authorization solution. It can also be skipped: a matcher that excludes a path skips it for Server Function calls on that path, and CVE-2025-29927 showed that even Middleware could be bypassed entirely by a forged header.
+
+Third, the forwarded header is a trust problem. Request headers can be supplied by the client, so a page that trusts `x-user-status` without verification can be lied to unless Proxy overwrites the header every time. Even then, a stale result passed through a header is no substitute for checking at the point of use.
+
+The right design separates the layers. Proxy does the cheap, stateless part: it reads the session cookie and redirects visitors who obviously have no session. Stateful checks, such as whether an account is suspended, belong in the Data Access Layer, which every page, Server Component, Server Function, and Route Handler calls:
+
+```js
+// app/lib/dal.js
+import 'server-only';
+import { cache } from 'react';
+import { redirect } from 'next/navigation';
+
+export const getCurrentUser = cache(async () => {
+  const session = await verifySession();
+  const user = await db.users.findUnique({ where: { id: session.userId } });
+
+  if (!user || user.accountStatus === 'suspended') {
+    redirect('/suspended');
+  }
+
+  return user;
+});
+```
+
+Proxy gives fast, early rejection of the common case. The DAL gives correct rejection for cases that depend on the current state of the account, and it applies to every entry point.
+</Answer>
+
+---
+
+<Question>
+**Trap 2: A developer omits the `matcher` config from their Proxy. What is the impact?**
+</Question>
+
+<Answer>
+Without a `matcher`, Proxy runs on every request to the application: pages, Route Handlers, and also static files under `_next/static`, image optimization requests under `_next/image`, and files in the `public/` folder.
+
+There are two costs. The first is correctness. A Proxy written for pages, for example one that redirects requests without a session cookie to `/login`, will also redirect requests for CSS, JavaScript chunks, and images. A signed-out visitor on the login page then receives redirects instead of the stylesheet, and the page loads without its styles or scripts. The Next.js documentation warns that auth logic or redirects can unintentionally block these assets.
+
+The second is overhead. A function invocation is added to every asset request. The cost of one invocation depends on your host and on what the code does, and a page can load dozens of assets, so unnecessary invocations add up.
+
+The fix is a negative matcher that runs Proxy on all pages and skips assets:
+
+```js
+export const config = {
+  matcher: [
+    '/((?!api|_next/static|_next/image|favicon.ico|sitemap.xml|robots.txt).*)',
+  ],
+};
+```
+
+Note what the pattern does not do. For authentication, the documentation recommends Proxy run on all page routes rather than a hand-picked list, since a forgotten route is unprotected. And `_next/data` requests still invoke Proxy even when excluded, on purpose, so a protected page cannot be read through its data route. If your Proxy does work that is not needed for prefetches, add a `missing` condition on the prefetch headers to skip them.
+</Answer>
+
+---
+
+<Question>
+**Trap 3: What is the difference between rewriting to a route that does not exist and redirecting to one? What happens in each case?**
+</Question>
+
+<Answer>
+If Proxy rewrites to a route that does not exist, for example `/home-variant-c` with no matching `app` route, Next.js processes the rewritten URL, finds nothing, and responds with a 404. The address bar still shows the original URL, because a rewrite does not change it. Nothing fails inside Proxy, so there is no error there: some visitors just see a 404 under a URL that is fine.
+
+If Proxy redirects to a route that does not exist, the browser receives the redirect, makes a new request to the destination, and gets a 404 with the destination URL visible in the address bar.
+
+The practical difference is debugging. A failed redirect shows you where you ended up. A failed rewrite hides it, so the URL gives no hint that a rewrite happened. With A/B tests, regional variants, or feature flags, only some visitors hit the bad destination (one group, one country), so the problem can go unnoticed. When you write rewrites, make sure every possible destination exists as a real route, and test each branch.
+</Answer>
+
+---
+
+### Self-Test
+
+<Question>
+**Q1.** Which runtime does Proxy use, what changed from Middleware, and what does that mean for what you can do in it?
+</Question>
+
+<Answer>
+Proxy runs on the Node.js runtime, and that cannot be configured: the `runtime` option is not available in Proxy files, and setting it throws an error. This is a change from Middleware, which defaulted to the Edge runtime. Next.js 15.2 added experimental Node.js support for Middleware and 15.5 made it stable, and Next.js 16 made Node.js the only runtime for the renamed `proxy` file. The Edge runtime is not supported in Proxy. If you need Edge, the documentation says to keep using the deprecated `middleware` file.
+
+The Edge runtime was a restricted environment based on Web Platform APIs, without Node.js built-ins such as `fs`, `net`, `tls`, or `child_process`, and without native modules. That is why Middleware on Edge could not use many database drivers or heavy libraries. With Proxy, those Node.js restrictions no longer apply.
+
+That does not mean Proxy should do more. Being able to import a database driver does not change the guidance: Proxy runs on every matched request, including prefetches, so it should stay stateless and fast, doing optimistic checks such as reading and verifying a cookie. Slow data fetching and real authorization belong elsewhere.
+</Answer>
+
+---
+
+<Question>
+**Q2.** A rewrite serves `/shop-us` content at `/shop` for visitors in the US and `/shop-gb` content for visitors in the UK. A US visitor bookmarks the page, moves to the UK, and opens the bookmark. What do they see, and why?
+</Question>
+
+<Answer>
+They see the UK shop, at the `/shop` URL. The bookmark stores `/shop`, because a rewrite does not change the visible URL. When they open it from the UK, Proxy reads their location (on Vercel, with the `geolocation` helper from `@vercel/functions`), sees the country `GB`, and rewrites the request to `/shop-gb`. The browser shows `/shop` while receiving the UK content.
+
+This is the advantage of a rewrite over a redirect for regional content. Bookmarks, shared links, and history all use the one canonical URL, and the regional content is chosen per request. A friend in Germany who opens the same link would get the German variant, if one exists.
+
+Two cautions. Location is host-specific: `request.geo` was removed from `NextRequest` in Next.js 15, so how you read the country depends on where you deploy. And because one URL now returns different content, anything that caches responses must take the location into account, or a cached UK page could be served to a US visitor. Also make sure every regional variant you rewrite to actually exists, or some visitors will get a 404.
+</Answer>
+
+---
+
+<Question>
+**Q3.** Why should database-backed authorization not live in Proxy, and where should it go?
+</Question>
+
+<Answer>
+Three reasons, all from how Proxy is meant to be used.
+
+First, cost and purpose. Proxy runs on every matched request, including the prefetches that `next/link` sends for routes on the page. A database check in Proxy multiplies across all of them. The Next.js documentation says Proxy is not intended for slow data fetching and recommends reading only the session cookie there, using it for optimistic checks.
+
+Second, coverage. Proxy is a routing layer with gaps by design. A matcher can exclude a path, and that also skips Proxy for Server Function calls on that path, since they are `POST` requests to the route where they are used. A refactor that moves a Server Function to another route can silently remove its coverage. Moreover, CVE-2025-29927 showed that a forged internal header could make vulnerable versions skip Middleware entirely, along with any authorization it performed. Access control that exists only in Proxy fails when Proxy is bypassed.
+
+Third, correctness. A cookie or JWT verified in Proxy proves the token was valid when it was issued and has not expired. It cannot know that the account was suspended, a role changed, or a session was revoked since. Only a check against current state can do that.
+
+The correct architecture has two layers. Proxy performs the optimistic check and redirects obviously unauthenticated visitors early. A Data Access Layer performs the secure check, verifying the session (against the database for database sessions) and authorizing the specific resource, and it is called from every page, Server Component, Server Function, and Route Handler that reads or changes protected data. There is one exception worth knowing: for static routes that share data between users, such as content behind a paywall, a DAL check does not run at request time, so Proxy is the tool the documentation suggests for protecting them.
+</Answer>

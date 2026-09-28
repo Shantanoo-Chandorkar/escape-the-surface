@@ -516,5 +516,47 @@
     "slug": "caching-layers-opt-out-and-revalidation",
     "category": "nextjs",
     "subcategory": "caching"
+  },
+  {
+    "id": 94,
+    "title": "What Server Actions are and what problem they solve",
+    "slug": "what-server-actions-are",
+    "category": "nextjs",
+    "subcategory": "server-actions"
+  },
+  {
+    "id": 95,
+    "title": "How Server Actions work under the hood",
+    "slug": "how-server-actions-work-under-the-hood",
+    "category": "nextjs",
+    "subcategory": "server-actions"
+  },
+  {
+    "id": 96,
+    "title": "Server Actions vs Route Handlers",
+    "slug": "server-actions-vs-route-handlers",
+    "category": "nextjs",
+    "subcategory": "server-actions"
+  },
+  {
+    "id": 97,
+    "title": "The Image component",
+    "slug": "the-image-component",
+    "category": "nextjs",
+    "subcategory": "performance-primitives"
+  },
+  {
+    "id": 98,
+    "title": "The Script component and font optimization",
+    "slug": "the-script-component-and-font-optimization",
+    "category": "nextjs",
+    "subcategory": "performance-primitives"
+  },
+  {
+    "id": 99,
+    "title": "Middleware and Proxy",
+    "slug": "middleware-and-proxy",
+    "category": "nextjs",
+    "subcategory": "performance-primitives"
   }
 ]

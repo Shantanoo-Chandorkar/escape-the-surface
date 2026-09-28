@@ -1,0 +1,390 @@
+---
+title: "How Server Actions work under the hood"
+category: "nextjs"
+subcategory: "server-actions"
+order: 95
+---
+
+# How Server Actions Work Under the Hood
+
+## Exploring how a Server Action travels from the browser to the server, how it is routed and protected, and what comes back
+
+### 1. The Problem
+
+The previous chapter established what Server Actions are and the developer experience they provide. The surface looks simple: write a function with `'use server'`, call it from a Client Component. But the mechanism that makes this possible has security and correctness implications that stay invisible until you need to debug them.
+
+Specifically: how does the browser call a server function that was never shipped to the browser? How does Next.js know which function to run when the request arrives? What stops an attacker from calling arbitrary server-side functions? What happens to the arguments on the way to the server? What does the server send back, and how does the client apply it?
+
+These questions matter beyond curiosity. The mechanism explains why Server Actions have the constraints they do (no plain function arguments, no class instances), why every Server Action is a `POST` and never a `GET`, how to debug a failing action, and which security guarantees you can and cannot rely on.
+
+---
+
+### 2. The Naive Attempt
+
+A developer wants to see what their Server Action actually sends over the wire. They open the DevTools Network tab and call this action:
+
+```jsx
+'use server';
+
+import { revalidatePath } from 'next/cache';
+import { getSession } from '@/lib/auth';
+import { db } from '@/lib/database';
+
+export async function updateUsername(newName) {
+  const session = await getSession();
+  if (!session) throw new Error('Unauthorized');
+  if (typeof newName !== 'string' || newName.trim().length === 0) throw new Error('Invalid name');
+
+  await db.users.update({ where: { id: session.userId }, data: { name: newName.trim() } });
+  revalidatePath('/profile');
+}
+```
+
+They see a `POST` request to their page URL (`/profile`) and are confused. Not to `/api/updateUsername`. Not to a special endpoint. To the same URL as the current page. The request has an odd `Next-Action` header and a body that looks like a JSON array, not a named JSON object. The response is not JSON and not plain HTML. It is a stream of text lines in a format they do not recognize.
+
+```
+Request                                  Response
+POST /profile                            200 OK
+Accept: text/x-component                 Content-Type: text/x-component
+Next-Action: <long opaque ID>            (Flight rows: the action result, and often
+Next-Router-State-Tree: <encoded>         a freshly rendered payload for /profile)
+Content-Type: text/plain;charset=UTF-8
+Body: ["Ada"]
+```
+
+They copy the request as `curl` and replay it. It works, until the next deployment, when the same request fails with a "Failed to find Server Action" error. They cannot build a valid request by hand for anything beyond trivial arguments, which means they cannot test the action in isolation from the browser.
+
+---
+
+### 3. Why That Breaks
+
+The failure mode is a mental model mismatch. Developers expect a Server Action to be a named API endpoint (like `/api/updateUsername`) that accepts JSON. It is not. It is a `POST` to the current page's URL, identified by a build-specific action ID in the `Next-Action` header, encoded with React's own serialization format, and answered in React's streaming wire format.
+
+Without this model, network failures are opaque, error responses are confusing, and it is easy to assume the action ID protects you more than it does.
+
+---
+
+### 4. Next.js's Mental Model
+
+At build time, Next.js splits every `'use server'` function into two views. On the server, the real function is registered under an action ID. In the client bundle, the function is replaced by a reference that knows only that ID and how to send a request. At runtime, the client sends a `POST` to the current page with the ID in the `Next-Action` header. The server looks the ID up in a table built at compile time, runs the function, and streams back the result, plus fresh UI if the action revalidated something.
+
+Three properties follow from this. Only `POST` can invoke an action, so a link or an image tag can never trigger one. Only functions that the compiler registered can be called, so an attacker cannot name an arbitrary server function. And action IDs are encrypted and change between builds, which makes them hard to guess but is not a substitute for checking who is calling.
+
+One sentence: Next.js replaces `'use server'` functions with ID-carrying references on the client and ID-keyed entries in a build-time manifest on the server, using React's serialization protocol over a `POST` to the current page as the transport.
+
+---
+
+### 5. Next.js's Solution
+
+The sketches below use React's real function names, but they are simplified. The generated code and the internal request and response details differ across Next.js and React versions. Use them to build a mental model, not as a specification.
+
+**Step 1: Build-time transformation.**
+
+When `next build` compiles a module with `'use server'`, the same source produces two outputs. In the server build, the real function is registered as a server reference with an action ID. In the client build, each export becomes a reference to that ID plus a dispatcher. The implementation never enters the client bundle.
+
+```js
+// What you write in app/actions.js
+'use server';
+export async function updateUsername(newName) {
+  // auth check, validation, database update, revalidatePath ...
+}
+
+// Server build (simplified): the real function, tagged with an ID
+registerServerReference(updateUsername, ACTION_ID, 'updateUsername');
+
+// Client build (simplified): no implementation, only a reference and a dispatcher
+export const updateUsername = createServerReference(ACTION_ID, callServer);
+```
+
+The build also writes a server actions manifest. It is how the server later maps an incoming ID back to a module and an export name. The same manifest carries the encryption key used for closed-over variables (covered in section 6).
+
+**Step 2: The client dispatches the call.**
+
+When a Client Component calls `updateUsername('Ada')`, the dispatcher runs. Conceptually:
+
+```js
+// Simplified from Next.js's client router
+async function callServer(actionId, args) {
+  // React's serializer: text for simple arguments, FormData when the arguments
+  // include FormData, Blob or File
+  const body = await encodeReply(args);
+
+  const response = await fetch(currentPageUrl, {
+    method: 'POST',
+    headers: {
+      Accept: 'text/x-component',
+      'Next-Action': actionId,
+      // Describes the route tree the browser is showing right now
+      'Next-Router-State-Tree': encodedRouterState,
+    },
+    body,
+  });
+
+  return createFromFetch(Promise.resolve(response)); // parse React's streaming response
+}
+```
+
+Notice that the `POST` goes to the URL of the page the user is on, not to a separate API endpoint. The `Next-Action` header is what tells the server that this is an action call and not a normal request for that page.
+
+`encodeReply` supports strings, numbers, booleans, `null`, `undefined`, `bigint`, arrays, plain objects, `Date`, `Map`, `Set`, typed arrays, `ArrayBuffer`, `FormData`, Promises, and Server Functions themselves. It does not support React elements, plain functions, class instances, or objects with a null prototype. That list is the reason for the argument constraints from the previous chapter.
+
+Next.js also sends actions one at a time from a given client: a second action waits for the first to finish.
+
+**Step 3: The server routes and runs the action.**
+
+The server receives the `POST`. The order of work matters:
+
+```js
+// Pseudocode of the order of work. Real names: decodeReply, decodeAction.
+async function handleActionRequest(req) {
+  if (req.method !== 'POST') return renderPageNormally(req); // only POST can invoke an action
+
+  assertOriginMatchesHost(req); // CSRF check; serverActions.allowedOrigins lists extra trusted origins
+  const body = await readBodyWithinLimit(req); // 1 MB by default; serverActions.bodySizeLimit raises it
+
+  const actionId = req.headers['next-action']; // absent for forms posted without JavaScript
+  const action = lookUpInManifest(actionId); // built at compile time; unknown IDs are rejected
+
+  const args = await decodeReply(body, serverModuleMap); // React turns the body back into real values
+  const result = await action(...args); // your function runs inside this request
+
+  return streamFlightResponse(result); // action result, plus fresh UI if something was revalidated
+}
+```
+
+The manifest lookup limits which functions can be reached: only functions the compiler registered are callable, and an ID that is not in the current build is rejected. Next.js reports this as "Failed to find Server Action" when the ID has a valid format but no match in this build, and as "Server Reference ID did not match the expected format" when the ID is not one this version generates. The HTTP status code for these errors differs between versions.
+
+The lookup decides what can be called. It does not decide whether this caller is allowed to call it. That is still your action's job.
+
+**Step 4: The response.**
+
+The response has content type `text/x-component`. It is not JSON. It is a stream in React's Flight format, and it carries up to two things:
+
+1. The action's return value. If the action threw, the stream carries a rejection instead, and current versions respond with status 500.
+2. A newly rendered payload for the current route, when the action revalidated data (`revalidatePath`, `updateTag`, `refresh`), mutated cookies, or redirected. This is a complete payload for the route, not a diff.
+
+Next.js also sets internal response headers that are useful when reading the Network tab, such as `x-action-revalidated` (the action invalidated cached data) and `x-action-redirect` (the action called `redirect`). They are implementation details and may change. The Flight rows themselves are an internal protocol: read them to understand what is happening, but never parse them yourself.
+
+This is why the page updates in one round trip: the fresh UI travels in the same HTTP response as the action's result.
+
+**Step 5: The client applies the response.**
+
+The client router reads the stream and does three things:
+
+1. It resolves the promise of the calling code with the return value (or rejects it with the error).
+2. If the action revalidated data, it clears the client-side router cache (the browser's stored copies of visited and prefetched routes), then applies the new route payload to the current page as if it were a navigation whose data is already known.
+3. If the action redirected, it navigates to the target. An external URL becomes a full browser navigation.
+
+**Form submissions, with and without JavaScript.**
+
+With JavaScript, React intercepts the form's `submit` event, builds a `FormData` object, and sends it through the same dispatch path as above, as a `multipart/form-data` body.
+
+Without JavaScript, there is no dispatcher and no `Next-Action` header. Instead, the server-rendered form is built so the browser can post it natively, with the action ID carried in the name of a hidden field:
+
+```html
+<!-- Simplified: server-rendered HTML for a form whose action is a Server Action -->
+<form method="POST" enctype="multipart/form-data">
+  <input type="hidden" name="$ACTION_ID_a1b2c3d4e5f6" />
+  <textarea name="content"></textarea>
+  <button type="submit">Submit</button>
+</form>
+```
+
+The field name starts with `$ACTION_ID_` and the rest is the action ID. When a `POST` arrives without a `Next-Action` header, the server scans the submitted form fields for names with that prefix (or `$ACTION_REF_` for actions that carry captured values) and hands the `FormData` to React's `decodeAction`, which finds the function and calls it with the form data. The progressive enhancement path therefore uses the same manifest and the same checks. A redirect after such a submission is a normal HTTP redirect with a `Location` header.
+
+---
+
+### 6. Internals
+
+**How action IDs work, and what they are not.**
+
+The Next.js documentation promises three things about action IDs: they are encrypted, they are non-deterministic, and they are recalculated between builds. They are cached for at most 14 days and regenerated when a new build starts or the build cache is invalidated. The exact algorithm is not part of the public contract, so do not build anything on it.
+
+IDs make it hard to guess a valid one and limit how long a captured ID stays useful. They do not identify the caller. A user who legitimately loads your page receives the IDs of every action that page references, in the JavaScript they download. That is why every Server Action must authenticate and authorize on its own. The ID only tells the server which function to run, never who is asking.
+
+Next.js also removes unused Server Actions from the client bundle at build time, so an action nothing references does not get a public endpoint. The documentation also states that an exported action can still be reachable by a direct `POST` even if your code never imports it. Treat dead code elimination as a safety net, not a security control.
+
+**The server actions manifest.**
+
+The manifest is produced at compile time from the functions marked `'use server'`. It maps action IDs to modules and export names, and it holds the encryption key described below. There is no API for registering an action at runtime, so an attacker cannot make the server run a function that the compiler did not register.
+
+**Encryption of closed-over values.**
+
+An inline Server Action inside a Server Component can capture variables from the surrounding scope:
+
+```jsx
+// app/posts/[id]/page.js  <- Server Component
+async function PostPage({ params }) {
+  const { id } = await params;
+  const post = await db.posts.findUnique({ where: { id } });
+  const postId = post.id; // capture one small value, not the whole record
+
+  async function deleteThisPost() {
+    'use server';
+    const session = await getSession();
+    if (!session) throw new Error('Unauthorized');
+
+    // Ownership check lives in the query
+    await db.posts.deleteMany({ where: { id: postId, authorId: session.userId } });
+    revalidatePath('/posts');
+  }
+
+  return (
+    <div>
+      <h1>{post.title}</h1>
+      <form action={deleteThisPost}>
+        <button type="submit">Delete</button>
+      </form>
+    </div>
+  );
+}
+```
+
+When the user submits the form, the request reaches a fresh server invocation that has no memory of this render. So how does it know `postId`? The captured value makes a round trip through the browser:
+
+1. While rendering, Next.js serializes the captured variables with React's Flight serializer.
+2. It encrypts the result with AES-GCM using the encryption key from the build, adding a random IV. The action ID is placed in front of the payload so it can be checked later.
+3. The result is one opaque Base64 string, embedded in the rendered output as part of the action reference.
+4. When the action is invoked, the string comes back in the request. The server decrypts it, verifies that it belongs to this action ID, and passes the restored values to your function.
+
+The browser only ever holds ciphertext. Tampering with it fails decryption, so the values are unreadable and unforgeable in transit. But the documentation is explicit that you should not rely on encryption alone to protect sensitive values, so never capture secrets in a closure. Capture the smallest value you need (`postId`, not the whole `post` record), because every captured value travels to the browser and back on each submission.
+
+By default the key is generated during the build. For self-hosted deployments with several server instances, set the `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` environment variable at build time to a base64-encoded AES key of 16, 24, or 32 bytes, so every instance can decrypt what another one encrypted. According to Next.js security guidance, values passed with `.bind()` are not encrypted, so treat them like any other client-visible argument.
+
+**`revalidatePath` inside an action.**
+
+`revalidatePath` does not wait for the action to finish and then compute a diff. What the documentation says about Server Functions is: the UI updates immediately if the user is viewing the affected path, and currently all previously visited pages also refresh when they are navigated to again. Called from a Route Handler instead, `revalidatePath` only marks the path, and the revalidation happens on the next visit.
+
+The arguments follow the route file structure, not the URL in the address bar. A literal path such as `/dashboard` refreshes that one page. A route pattern with a dynamic segment, such as `/blog/[slug]`, requires the `type` argument (`'page'` or `'layout'`). The `'layout'` type also covers every page beneath that layout. If the route is rewritten, pass the destination path, not the source.
+
+**Errors.**
+
+When an action throws, the client-side call rejects. In production React replaces the message with a generic one and sends a digest that you can match against server logs, and in development the message is sent in full. Expected failures such as validation errors should be returned as values, as covered in the previous chapter.
+
+**Deployment skew.**
+
+Action IDs belong to a build. A browser tab still running the previous deployment may call an ID that no longer exists, and the server answers with the "Failed to find Server Action" error. Keep client assets and server code on the same deployment (on Vercel, Skew Protection keeps the previous version available), and for multi-instance self-hosting set the same encryption key everywhere.
+
+---
+
+### 7. Interview Traps
+
+<Question>
+**Trap 1: A developer logs `process.env.DATABASE_URL` inside a Server Action and it prints correctly. A junior developer argues, "Server Actions run on the server, so every `process.env` variable is fine to use and return." Is that correct, and what is the nuance?**
+</Question>
+
+<Answer>
+Partially correct. Server Actions run on the server, so server-side environment variables, including secrets like `DATABASE_URL` or `API_SECRET_KEY`, are readable through `process.env` inside them.
+
+The nuance is what leaves the server. Next.js has two categories of environment variables. Variables without the `NEXT_PUBLIC_` prefix stay on the server: they work in Server Actions and Server Components and are never included in the client bundle. Variables with the `NEXT_PUBLIC_` prefix are inlined into the client bundle at build time and visible to anyone. Inside a Client Component, `process.env.DATABASE_URL` is `undefined` because it was never bundled.
+
+The security risk is the return value. Whatever a Server Action returns is serialized and sent to the browser, so returning `{ dbUrl: process.env.DATABASE_URL }` hands that secret to every caller. The same goes for values captured in an inline action's closure, which travel to the browser (encrypted) and back. Read secrets inside the action, use them there, and return only what the UI needs.
+</Answer>
+
+---
+
+<Question>
+**Trap 2: An attacker captures a Server Action request in DevTools and replays it with modified arguments. What is the security model, and what must the developer do to prevent the attack?**
+
+```jsx
+'use server';
+
+export async function updateUserProfile(userId, data) {
+  const session = await getSession();
+  if (!session) throw new Error('Unauthorized');
+
+  await db.users.update({ where: { id: userId }, data });
+}
+```
+</Question>
+
+<Answer>
+The action ID and the framework protections do not prevent argument tampering. The ID identifies which function to call. It does not authenticate the caller and it does not validate the arguments. Next.js provides the transport and a set of framework-level protections: `POST` only, an `Origin` versus `Host` check against cross-site forgery, encrypted and build-specific IDs, removal of unused actions, and a body size limit. None of these decide whether this user may change this record. That decision is the developer's, exactly as with an API route.
+
+In the code above, the session check only proves that someone is logged in. Any logged-in user can pass another user's `userId` and overwrite their profile (an insecure direct object reference). Passing the whole `data` object straight to the database is a second hole: the attacker can set fields the form never offered.
+
+The fix is to stop trusting the client for identity and for shape:
+
+```jsx
+'use server';
+
+export async function updateUserProfile(data) {
+  const session = await getSession();
+  if (!session) throw new Error('Unauthorized');
+
+  // Only the fields the schema allows get through
+  const validatedProfile = profileSchema.parse(data);
+
+  // Identity comes from the session, never from an argument
+  await db.users.update({ where: { id: session.userId }, data: validatedProfile });
+}
+```
+
+If an admin must edit other users, keep a `userId` argument but check the caller's role against the target before touching the record. In every case, treat every argument as attacker-controlled. The `Origin` check stops another website from forging a request in a victim's browser. It does not stop a logged-in attacker from sending their own edited request.
+</Answer>
+
+---
+
+<Question>
+**Trap 3: A developer calls `revalidatePath('/dashboard')` inside a Server Action, but the dashboard does not update. The Network tab shows the action returned 200. What are the two most likely causes?**
+</Question>
+
+<Answer>
+The first suspect people reach for is the browser's Router Cache, but it is not the likely cause here. When an action revalidates data, the client clears its router cache and applies the fresh payload, so `router.refresh()` is not needed to fix this. The two more likely causes are these.
+
+First, the path does not match what the user is looking at. `revalidatePath` works on the route file structure, not the address bar. `revalidatePath('/dashboard')` refreshes only that page, so a user viewing `/dashboard/analytics` is not covered. A route with a dynamic segment must be given as a pattern with a type, as in `revalidatePath('/dashboard/[section]', 'page')`. Passing `'layout'` covers the layout and every page beneath it, as in `revalidatePath('/dashboard', 'layout')`. If the route is rewritten, the destination path must be used, because cache entries belong to the route file that renders them. The UI updates immediately only for the path the user is currently viewing.
+
+Second, the action did not include a re-render of the current route in its response. This happens when the action used `revalidateTag` to mark data stale. `revalidateTag` follows stale-while-revalidate: the next reads still get stale data while a fresh fetch runs in the background, so the action's own response does not wait for it, and the page shows the change on a later read. For read-your-own-writes, use `updateTag` (available in Server Actions only) or `revalidatePath`. The same idea applies to `revalidatePath` called from a Route Handler instead of an action: it only marks the path, and the revalidation happens on the next visit. If the data changed is not cached at all, `refresh()` from `next/cache` re-renders the current route without invalidating cached data.
+</Answer>
+
+---
+
+### Self-Test
+
+<Question>
+**Q1.** Why are Server Action requests sent as a `POST` to the current page URL rather than to a dedicated `/api/action` endpoint?
+</Question>
+
+<Answer>
+Routing the request through the page URL gives the action the context of the page it was called from. The request carries a description of the route tree the browser is showing (the `Next-Router-State-Tree` header), so the server can work out what to re-render. When the action revalidates data, the server renders the current route and puts the new payload in the same response as the action's return value. The client gets the result and the updated page in one round trip. A separate `/api/action` endpoint would have no idea which page the user is on, and the client would need a second request to fetch the updated UI.
+
+It also keeps progressive enhancement simple. A form posted without JavaScript goes to the page URL the browser is already on. With no `Next-Action` header available, the server finds the action through the hidden `$ACTION_ID_` field in the form data, resolves it through the same manifest, and responds with the page.
+
+Finally, actions live on the page that uses them and inherit that page's access control. As of Next.js's own security guidance, if middleware lets a user read a page, that user can also invoke the actions on that page. To restrict actions on a page, restrict the `POST` method on it.
+
+The `Next-Action` header separates action calls from ordinary requests to the same URL. Without it (and without `$ACTION_ID_` fields in a form body), a `POST` is not treated as an action call.
+</Answer>
+
+---
+
+<Question>
+**Q2.** What prevents an attacker from calling arbitrary server functions by guessing an action ID, and what do those protections not do?
+</Question>
+
+<Answer>
+Several layers work together.
+
+First, the ID itself. Action IDs are encrypted and non-deterministic, and they change between builds, so an attacker cannot derive one from an action's name or file path and a captured one stops working after a new build.
+
+Second, the manifest. Only functions the compiler registered as Server Actions are in the build-time manifest. An ID that has a valid format but no entry produces a "Failed to find Server Action" error, and an ID in the wrong format is rejected as malformed. Arbitrary helpers and utilities are not in the manifest even if their code exists on the server. Next.js also removes unused actions from the client bundle, although you should not depend on that alone.
+
+Third, request-level checks. Only `POST` can invoke an action, the `Origin` header must match the `Host` (or an entry in `allowedOrigins`), and the body is capped at 1 MB by default.
+
+None of these is authorization. A legitimate visitor receives the IDs of the actions their page uses, and any signed-in user can call those actions with any arguments they like. Each Server Action must authenticate, authorize against the specific resource, and validate its arguments, treating everything the client sends as untrusted.
+</Answer>
+
+---
+
+<Question>
+**Q3.** What happens to variables captured by an inline Server Action defined in a Server Component? How do they travel from the server to the browser and back?
+</Question>
+
+<Answer>
+The variables the action closes over are needed when the action runs, but the request that runs it is a new invocation with no memory of the original render. So they take a round trip.
+
+While rendering, Next.js serializes the captured values with React's Flight serializer and encrypts the result with AES-GCM, using a random IV and the encryption key generated at build time (or the key from `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY`). The action ID is placed in front of the payload as an integrity check. The result is a single opaque Base64 string that becomes part of the action reference in the rendered output.
+
+When the user triggers the action, the browser sends that string back with the request. The server decrypts it, verifies that it belongs to this action ID, and calls the function with the restored values.
+
+The browser only sees ciphertext, and modifying it makes decryption fail. That protects the values in transit, but it does not make it safe to capture secrets: Next.js documentation says not to rely on encryption alone. Capture as little as possible, such as `const postId = post.id` instead of the whole record, since everything captured travels with every submission. If you run several server instances, they must share the same key, or an instance will not be able to decrypt what another one encrypted. Values passed with `.bind()` are not encrypted at all and are ordinary client-visible arguments.
+</Answer>

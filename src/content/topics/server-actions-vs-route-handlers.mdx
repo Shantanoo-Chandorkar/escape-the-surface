@@ -1,0 +1,676 @@
+---
+title: "Server Actions vs Route Handlers"
+category: "nextjs"
+subcategory: "server-actions"
+order: 96
+---
+
+# Server Actions vs Route Handlers
+
+## Exploring when to use a Server Action, when to use a Route Handler, and how both can share one data layer
+
+### 1. The Problem
+
+Server Actions exist. Route Handlers still exist. Next.js did not deprecate its endpoint mechanism when it introduced Server Actions. This means developers now face a choice for every mutation and every endpoint: which one do I use?
+
+The wrong answer is "always use Server Actions now because they are newer." The wrong answer is also "keep using endpoints because I know them." Both tools exist because they solve different problems. Using Server Actions for everything means losing capabilities you need. Using endpoints for everything means writing boilerplate you do not need and giving up the form and UI integration that Server Actions provide.
+
+The correct answer requires knowing what each tool is for, which capabilities only one of them has, and which signals point to which.
+
+**First, the names, because two routers are involved.**
+
+Next.js has two routers, and each one has its own way to write a server endpoint:
+
+- In the **Pages Router** (the `pages/` directory), the tool is called an **API Route**. A file under `pages/api` exports one default function that receives Node's `req` and `res` objects.
+- In the **App Router** (the `app/` directory), the tool is called a **Route Handler**. A `route.js` file exports one function per HTTP method, and those functions use the Web `Request` and `Response` objects.
+
+This lesson uses the App Router names. When an older article says "API Route" for a project that uses the `app/` directory, it means a Route Handler. Server Actions are documented as an App Router feature, and the Pages Router has no equivalent, so a Pages Router application uses API Routes for every mutation.
+
+| Concern | Pages Router (`pages/`) | App Router (`app/`) |
+| --- | --- | --- |
+| Server endpoint | API Route: a file in `pages/api` | Route Handler: a `route.js` file |
+| Handler shape | One default export, `handler(req, res)` | One named export per method: `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS` |
+| Request and response objects | Node `http.IncomingMessage` and `http.ServerResponse` with Express-like helpers such as `res.status(200).json()` | Web `Request` (as `NextRequest`) and `Response` |
+| Choosing the method | Check `req.method` inside the single handler | Export a function named after the method |
+| Request body | `req.body`, parsed automatically by default | Read on demand: `request.json()`, `request.text()`, `request.formData()` |
+| Raw body for signature checks | Set `config.api.bodyParser` to `false`, then read the stream | `request.text()`, no extra configuration |
+| Reading data for a page | `getServerSideProps`, `getStaticProps` | Server Components |
+| Mutating data from your own UI | `fetch` to an API Route | Server Actions (or a Route Handler) |
+| Static export | API Routes are not supported | Only `GET` Route Handlers with `dynamic = 'force-static'` |
+
+Both routers can live in the same project, and `pages/api` handlers keep working while you migrate page by page. In the `app/` directory, a `route.js` file cannot share a folder with a `page.js` file, because each one would take over every HTTP method for that path.
+
+---
+
+### 2. The Naive Attempt
+
+A developer migrates their entire API to Server Actions. Every file in `pages/api` becomes a `'use server'` function. The comment form works. The profile update works. Then they try to migrate their webhook receiver:
+
+```js
+// Old: pages/api/stripe-webhook.js  (Pages Router API Route)
+import getRawBody from 'raw-body';
+
+// The Pages Router parses the body by default, which would break the signature check
+export const config = { api: { bodyParser: false } };
+
+export default async function handler(req, res) {
+  const signature = req.headers['stripe-signature'];
+  const rawBody = await getRawBody(req);
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(rawBody, signature, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (error) {
+    return res.status(400).send('Webhook signature verification failed');
+  }
+
+  // Handle event...
+  res.status(200).json({ received: true });
+}
+```
+
+```jsx
+// Attempted migration: app/actions.js
+'use server';
+
+export async function handleStripeWebhook(/* what goes here? */) {
+  // Stripe does not know your action ID and cannot send React's request format
+  // There is no access to the raw request body, so the signature cannot be verified
+  // There is no way to return the status code and body Stripe expects
+  // This cannot work
+}
+```
+
+The migration fails because a Server Action is not an endpoint that outside callers can use. Technically, an action can be reached by a direct `POST`, but that is not a supported interface: its ID changes with every build, and its request format is React's internal protocol. Stripe decides the URL, the method, the headers, and the body it sends. It cannot adapt to any of that. Server Actions are built for browser-to-server calls that start in your own application.
+
+---
+
+### 3. Why That Breaks
+
+The precise failure mode: **Server Actions are an RPC mechanism for your own application's UI to call your own server. Route Handlers are HTTP endpoints for any caller, with full control over the method, headers, body, and response.**
+
+Server Actions solve the problem of mutations that start in your own UI. Route Handlers solve the problem of exposing an HTTP interface to anything else. These are different problems.
+
+Notice what they have in common. Both are public network entry points that anyone can send a request to. Neither one is safe because of where it is called from. Both must authenticate, authorize, and validate on their own.
+
+---
+
+### 4. Next.js's Mental Model
+
+Server Actions and Route Handlers serve different callers.
+
+A Server Action's caller is your own React code. It is reached through a `POST` that Next.js builds for you, using React's serialization protocol and a build-specific action ID. It can also be reached by a hand-made `POST`, but that is not a supported way to call it, so treat it as an internal interface.
+
+A Route Handler's caller is anyone who can make an HTTP request: your own Client Components, third-party services, mobile apps, other servers, webhook providers, public API consumers. It is a configurable endpoint with full control over method, headers, request body, and response.
+
+Reads for your own pages belong to neither tool. Server Components fetch data directly from its source.
+
+One sentence: use a Server Action when the caller is your own React UI and the operation is a mutation; use a Route Handler when the caller is anything else, or when you need control over the HTTP request and response.
+
+---
+
+### 5. The Decision Matrix
+
+| Signal | Use | Why |
+| --- | --- | --- |
+| Form submission from your own UI | Server Action | Form state hooks, progressive enhancement, and a UI refresh in the same response |
+| Button click that mutates data in your UI | Server Action | Called like a function; revalidation refreshes the page in one round trip |
+| Optimistic UI | Either | `useOptimistic` works with any async function inside a transition |
+| Session or cookie access in the mutation | Either | `cookies()` and `headers()` from `next/headers` work in both |
+| Must work without JavaScript | Server Action | A Server Component form submits without JS; a Route Handler can receive a native form post, but you write the whole response yourself |
+| Reading data to render your own page | Server Component | Neither tool: call the data layer directly |
+| Data fetched in the browser on an interval or from client-only Web APIs | Route Handler | Client libraries such as SWR or React Query need a URL to call |
+| Webhook receiver (Stripe, GitHub) | Route Handler | The sender controls URL, method, and headers, and the raw body is needed for signature checks |
+| Third-party or partner service calling you | Route Handler | It needs a stable, documented HTTP interface |
+| Mobile app or non-Next.js client | Route Handler | Standard HTTP with your own authentication scheme |
+| Specific HTTP method, custom status codes, or custom response headers | Route Handler | Server Actions are always `POST` and return serialized values, not a `Response` |
+| Public REST or GraphQL API | Route Handler | It is an HTTP contract by definition |
+| Cacheable `GET`, file download, RSS or similar non-UI response | Route Handler | It needs a URL and full control of the response |
+| OAuth callback | Route Handler | A `GET` that redirects and sets cookies, and must validate its redirect target |
+
+---
+
+### 6. Next.js's Solution
+
+**What Route Handlers can do that Server Actions cannot.**
+
+Full HTTP method control:
+
+```jsx
+// app/api/products/[id]/route.js
+import { getApiUser } from '@/lib/api-auth';
+import { productUpdateSchema } from '@/lib/product-schemas';
+
+export async function GET(request, { params }) {
+  const { id } = await params; // params is a Promise in Next.js 15 and later
+  const product = await db.products.findUnique({ where: { id } });
+  if (!product) return new Response('Not found', { status: 404 });
+
+  return Response.json(product); // this endpoint is public on purpose
+}
+
+export async function PUT(request, { params }) {
+  const { id } = await params;
+
+  const apiUser = await getApiUser(request);
+  if (!apiUser) return new Response('Unauthorized', { status: 401 });
+
+  const parsedUpdate = productUpdateSchema.safeParse(await request.json().catch(() => null));
+  if (!parsedUpdate.success) {
+    return Response.json({ error: 'Invalid product data' }, { status: 400 });
+  }
+
+  // Ownership lives in the query, and only the fields the schema allows are written
+  const { count } = await db.products.updateMany({
+    where: { id, ownerId: apiUser.id },
+    data: parsedUpdate.data,
+  });
+  if (count === 0) return new Response('Not found', { status: 404 });
+
+  return Response.json({ updated: true });
+}
+
+export async function DELETE(request, { params }) {
+  const { id } = await params;
+
+  const apiUser = await getApiUser(request);
+  if (!apiUser) return new Response('Unauthorized', { status: 401 });
+
+  const { count } = await db.products.deleteMany({ where: { id, ownerId: apiUser.id } });
+  if (count === 0) return new Response('Not found', { status: 404 });
+
+  return new Response(null, { status: 204 });
+}
+```
+
+Server Actions are always `POST`. You cannot define a Server Action that answers a `GET` or a `DELETE`. Route Handlers export named functions that match HTTP method names, and each method is handled independently. Every Route Handler is a public endpoint, so the `PUT` and `DELETE` above authenticate the caller, validate the body, and scope the query to the caller's own records.
+
+Raw request access and custom responses:
+
+```jsx
+// app/api/webhooks/stripe/route.js
+export async function POST(request) {
+  // The raw, unparsed body: the signature is computed over exactly these bytes
+  const rawBody = await request.text();
+  const signature = request.headers.get('stripe-signature');
+  if (!signature) return new Response('Missing signature', { status: 400 });
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(rawBody, signature, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (error) {
+    console.error('Stripe webhook signature verification failed', { message: error.message });
+    return new Response('Webhook signature verification failed', { status: 400 });
+  }
+
+  await handleStripeEvent(event);
+
+  // Stripe treats any non-2xx status as a failed delivery and retries it
+  return Response.json({ received: true });
+}
+```
+
+Signature verification needs the body exactly as the sender produced it. Frameworks that parse the body first can change whitespace or key order and break the signature. In the App Router, `request.text()` gives you the raw body with no configuration. In the Pages Router you had to turn the body parser off, as in the old API Route above.
+
+Callable by external services:
+
+```jsx
+// app/api/webhooks/github/route.js
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+export async function POST(request) {
+  const receivedSignature = request.headers.get('x-hub-signature-256') ?? '';
+  const rawBody = await request.text();
+
+  const expectedSignature = `sha256=${createHmac('sha256', process.env.GITHUB_WEBHOOK_SECRET)
+    .update(rawBody)
+    .digest('hex')}`;
+
+  // timingSafeEqual throws when the lengths differ, so compare lengths first
+  const receivedBuffer = Buffer.from(receivedSignature);
+  const expectedBuffer = Buffer.from(expectedSignature);
+  if (
+    receivedBuffer.length !== expectedBuffer.length ||
+    !timingSafeEqual(receivedBuffer, expectedBuffer)
+  ) {
+    return new Response('Unauthorized', { status: 401 });
+  }
+
+  try {
+    await processGithubEvent(JSON.parse(rawBody));
+  } catch (error) {
+    console.error('GitHub webhook processing failed', { message: error.message });
+    return new Response('Bad request', { status: 400 });
+  }
+
+  return new Response('OK', { status: 200 });
+}
+```
+
+GitHub can `POST` to this URL. GitHub does not know your Server Action IDs, and it cannot produce React's request format. Any external service that pushes data to your application needs a Route Handler. The signature comparison uses `timingSafeEqual` because GitHub's documentation warns against comparing signatures with a plain equality operator, which can leak information through timing.
+
+**What Server Actions can do that Route Handlers cannot.**
+
+A UI refresh in the same response as the mutation:
+
+```jsx
+'use server';
+
+export async function addToCart(productId) {
+  const session = await getSession();
+  if (!session) throw new Error('Unauthorized');
+  if (typeof productId !== 'string') throw new Error('Invalid input');
+
+  await db.cart.create({ data: { productId, userId: session.userId } });
+
+  revalidatePath('/cart'); // the re-rendered /cart travels back in this action's response
+}
+```
+
+When a Server Action calls `revalidatePath`, Next.js re-renders the current route on the server and includes the new payload in the same response as the action's result. One round trip covers both the mutation and the UI update. After a Route Handler mutation, the client has to refresh by itself: with `router.refresh()`, with a refetch, or with a page reload.
+
+Progressive enhancement and React form integration:
+
+```jsx
+// Server Component form using a Server Action
+function CommentForm({ postId }) {
+  async function submit(formData) {
+    'use server';
+    // addComment authenticates the caller and validates the content
+    await addComment(postId, String(formData.get('content') ?? ''));
+  }
+
+  return (
+    <form action={submit}>
+      <textarea name="content" />
+      <button type="submit">Post</button>
+    </form>
+  );
+}
+```
+
+This form is submitted even if JavaScript has not loaded. With JavaScript, React handles the submission and pending state, and hooks such as `useActionState` and `useFormStatus` work with the action directly. An HTML form can also `POST` natively to a Route Handler, which reads it with `request.formData()`. But then you write the whole response yourself, usually a redirect, and you lose the React state integration.
+
+Built-in request protection: every Server Action call is a `POST`, and Next.js compares the `Origin` header to the `Host` header. Route Handlers get neither by default. If a Route Handler authenticates with cookies and changes data, protecting it against cross-site request forgery is your job.
+
+What they share: both can read cookies and headers through `cookies()` and `headers()` from `next/headers`, and a Route Handler can also use `request.cookies` and `request.headers`. Session access is therefore not a reason to choose either one.
+
+**The hybrid pattern: using both together.**
+
+Many applications need both. The correct pattern is not either/or:
+
+```
+app/
+  actions.js              <- Server Actions for UI mutations
+  api/
+    webhooks/
+      stripe/
+        route.js          <- Route Handler: Stripe webhook receiver
+      github/
+        route.js          <- Route Handler: GitHub webhook receiver
+    v1/
+      products/
+        route.js          <- Route Handler: public REST API for mobile clients
+lib/
+  products-service.js     <- shared mutation logic used by both
+```
+
+The mutation logic lives in one place:
+
+```js
+// lib/products-service.js
+import { productSchema } from '@/lib/product-schemas';
+
+export async function createProduct(input, userId) {
+  const validatedProduct = productSchema.parse(input); // unknown fields are stripped
+  return db.products.create({ data: { ...validatedProduct, createdBy: userId } });
+}
+
+export async function deleteProduct(productId, userId) {
+  // Ownership lives in the query: callers can only delete their own products
+  const { count } = await db.products.deleteMany({ where: { id: productId, createdBy: userId } });
+  return count > 0;
+}
+```
+
+```jsx
+// app/actions.js  <- internal mutations from your own UI
+'use server';
+
+import { revalidatePath } from 'next/cache';
+import { getSession } from '@/lib/auth';
+import { createProduct, deleteProduct } from '@/lib/products-service';
+
+export async function createProductAction(input) {
+  const session = await getSession();
+  if (!session) throw new Error('Unauthorized');
+
+  const product = await createProduct(input, session.userId);
+  revalidatePath('/products');
+  return { id: product.id };
+}
+
+export async function deleteProductAction(productId) {
+  const session = await getSession();
+  if (!session) throw new Error('Unauthorized');
+  if (typeof productId !== 'string') throw new Error('Invalid input');
+
+  await deleteProduct(productId, session.userId);
+  revalidatePath('/products');
+}
+```
+
+```jsx
+// app/api/v1/products/route.js  <- external API for mobile and third parties
+export async function GET(request) {
+  const { searchParams } = new URL(request.url);
+  const page = Math.max(1, Number.parseInt(searchParams.get('page') ?? '1', 10) || 1);
+  const pageSize = 20; // fixed on the server so callers cannot request huge pages
+
+  const [products, total] = await Promise.all([
+    db.products.findMany({ skip: (page - 1) * pageSize, take: pageSize }),
+    db.products.count(),
+  ]);
+
+  return Response.json({ data: products, page, total });
+}
+```
+
+The `GET /api/v1/products` endpoint is for external consumers: the mobile app, partners, public API users. The Server Actions handle the admin UI's product operations. They share the same database and the same service functions but serve different callers through different interfaces. Authentication differs by caller: a session cookie for the web UI and a token or API key for outside clients.
+
+**A specific case: calling your own Route Handler from a Server Component.**
+
+Sometimes you have an existing Route Handler and want to use its data in a Server Component. The Next.js documentation says to fetch data in Server Components directly from its source, not through Route Handlers:
+
+```jsx
+// Avoid: a Server Component calling its own Route Handler
+async function ProductList() {
+  // An HTTP request from your server to your own server
+  const response = await fetch('http://localhost:3000/api/v1/products');
+  const products = await response.json();
+  return <ul>{products.data.map((product) => <li key={product.id}>{product.name}</li>)}</ul>;
+}
+
+// Prefer: a Server Component calling the data layer directly
+async function ProductList() {
+  const products = await getProducts();
+  return <ul>{products.map((product) => <li key={product.id}>{product.name}</li>)}</ul>;
+}
+```
+
+A server-side `fetch` needs an absolute URL, which means a real HTTP round trip. For a page that is prerendered at build time, the call fails the build, because no server is listening yet. For a page rendered on demand, it is slower because of the extra round trip between the handler and the render process. Extract the data access into a shared function that both consumers call:
+
+```js
+// lib/products.js  <- shared data access layer
+export async function getProducts({ page = 1, pageSize = 20 } = {}) {
+  return db.products.findMany({ skip: (page - 1) * pageSize, take: pageSize });
+}
+```
+
+```jsx
+// In a Server Component:
+import { getProducts } from '@/lib/products';
+const products = await getProducts();
+
+// In a Route Handler (for external callers):
+import { getProducts } from '@/lib/products';
+
+export async function GET() {
+  const products = await getProducts();
+  return Response.json({ data: products });
+}
+```
+
+One data access function, two consumers, and no needless HTTP round trip for internal callers.
+
+---
+
+### 7. Internals
+
+**How Route Handlers are defined in the App Router.**
+
+A Route Handler is a `route.js` file that exports async functions named after HTTP methods: `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, and `OPTIONS`. Each function receives a `request` and an optional context object:
+
+```jsx
+// app/api/products/[id]/route.js
+export async function GET(request, { params }) {
+  // request: NextRequest, an extension of the Web Request (headers, url, method, cookies, nextUrl)
+  const { id } = await params; // a Promise in Next.js 15 and later, a plain object in 14 and earlier
+  return Response.json({ id });
+}
+```
+
+These are Web Platform `Request` and `Response` objects, not Node's `req` and `res`. A few facts from the Next.js documentation:
+
+- If you do not export `OPTIONS`, Next.js implements it for you and sets the `Allow` header from the other methods you exported. A method you did not export is answered with `405 Method Not Allowed`.
+- Route Handlers run on the Node.js runtime by default. You opt into the Edge runtime with `export const runtime = 'edge'`. That is why the GitHub example above can import `node:crypto`.
+- In Next.js 15 and later, `GET` handlers are dynamic by default. In 14 they were static by default. You opt into static or timed caching with `export const dynamic = 'force-static'` or `export const revalidate = 60`.
+- `headers()` from `next/headers` is read-only. To set response headers or a status code, return a new `Response`.
+- Some hosts deploy Route Handlers as serverless functions. Handlers then cannot share memory between requests, may be stopped by timeouts, and cannot hold WebSockets open.
+- In a static export (`output: 'export'`), only `GET` Route Handlers work, and they need `dynamic = 'force-static'`.
+
+**CORS.**
+
+A Server Action call comes from your own page, so there is no cross-origin request to configure in normal use, and Next.js also rejects action requests whose `Origin` does not match the `Host`. API Routes in the Pages Router are same-origin by default too. A Route Handler that serves callers from other origins must be configured. Browsers send a preflight `OPTIONS` request first:
+
+```jsx
+// app/api/v1/products/route.js
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+};
+
+export async function OPTIONS() {
+  return new Response(null, { status: 204, headers: corsHeaders });
+}
+
+export async function GET() {
+  const products = await getProducts();
+  return Response.json({ data: products }, { headers: corsHeaders });
+}
+```
+
+Use `*` only for public data that does not depend on cookies or other credentials. To apply the same CORS headers to many Route Handlers, use `proxy` or the `headers` option in `next.config.js` instead of repeating them in every file.
+
+**Public endpoints need their own defenses.**
+
+Route Handlers are public HTTP endpoints. Authenticate and authorize inside them, validate every input, keep internal details out of error responses, and consider rate limiting. Server Actions need the same discipline, as the earlier chapters showed. The difference is what the framework adds around them: Server Actions come with the `POST`-only rule and the `Origin` versus `Host` check, and a Route Handler has only the protections you write.
+
+---
+
+### 8. Interview Traps
+
+<Question>
+**Trap 1: A developer says "I'll use Route Handlers for everything because they are more flexible and I am comfortable with them." What specific capabilities do they lose compared to Server Actions?**
+</Question>
+
+<Answer>
+Three concrete capabilities.
+
+First, the UI refresh in the same response. When a Server Action calls `revalidatePath` or another revalidation function, Next.js re-renders the current route and sends the new payload back together with the action's result. The page updates in one round trip. After a Route Handler mutation, the client has to trigger the refresh itself with `router.refresh()`, a refetch, or a reload, which is an extra request for every mutation that changes server-rendered content.
+
+Second, progressive enhancement and React integration. A form whose `action` is a Server Action submits even if JavaScript has not loaded, and with JavaScript it works with `useActionState`, `useFormStatus`, and transitions for pending and result state. A form can post natively to a Route Handler too, but the handler has to parse the `FormData` and build the response, usually a redirect, and none of the React state integration exists.
+
+Third, built-in request protection and a shared call signature. Server Actions accept only `POST` and compare the `Origin` header to the `Host` header, so cross-site form forgery is blocked by the framework. A Route Handler that authenticates with cookies gets neither check and must implement CSRF protection itself. A Server Action is also imported and called as a function, so its parameters are visible to the editor and the compiler. That is a compile-time convenience only: the action must still validate its arguments at runtime, because clients control them.
+
+Session access is not on this list. Route Handlers can use the same `cookies()` and `headers()` functions as Server Actions, and `request.cookies` as well.
+</Answer>
+
+---
+
+<Question>
+**Trap 2: Can a Server Action replace a `GET` Route Handler for data fetching? When would that be a mistake?**
+</Question>
+
+<Answer>
+No. Server Actions are always `POST`, so there is no way to define one that answers a `GET`. More fundamentally, they are designed for mutations, not reads. The Next.js documentation says that their primary purpose is to mutate data from your frontend client.
+
+For reading data in your own application, Server Components are the replacement for `GET` endpoints. A Server Component queries the database or calls an external API directly, with no HTTP endpoint in between.
+
+Using a Server Action for reads is a mistake for several reasons. Server Actions are queued: Next.js dispatches them one at a time per client, so using them for data fetching introduces sequential execution, and a slow read can hold up a mutation behind it. Their results are not cached the way a `GET` response can be by browsers, CDNs, or the Next.js caches. And React's own documentation describes Server Functions as designed for mutations.
+
+The correct split: reads go through Server Components (direct data access) or `GET` Route Handlers (for external consumers, for client-side libraries that poll, and for cacheable responses). Mutations go through Server Actions (for your own UI) or `POST`, `PUT`, and `DELETE` Route Handlers (for external callers or anything needing full HTTP control).
+</Answer>
+
+---
+
+<Question>
+**Trap 3: A mobile app needs to call mutations in your Next.js backend. Should those mutations be Server Actions or Route Handlers?**
+</Question>
+
+<Answer>
+Route Handlers. A mobile app is not a supported caller of Server Actions. The action ID is generated by the build and lives inside your web application's JavaScript. It changes with new builds, and it is not published anywhere for outside callers. The request format is React's internal serialization protocol, which is not a documented contract you can build a mobile client against.
+
+Mobile apps communicate over standard HTTP. They need endpoints with documented methods, paths, request and response bodies, and an authentication scheme, usually a Bearer token in the `Authorization` header instead of a session cookie. Route Handlers expose exactly that:
+
+```jsx
+// app/api/v1/cart/route.js
+export async function POST(request) {
+  const user = await verifyBearerToken(request.headers.get('authorization'));
+  if (!user) return new Response('Unauthorized', { status: 401 });
+
+  const parsedItem = cartItemSchema.safeParse(await request.json().catch(() => null));
+  if (!parsedItem.success) {
+    return Response.json({ error: 'Invalid cart item' }, { status: 400 });
+  }
+
+  await addToCartCore(parsedItem.data.productId, parsedItem.data.quantity, user.id);
+
+  return Response.json({ success: true }, { status: 201 });
+}
+```
+
+The mobile app sends a Bearer token, the handler verifies it, validates the body, and runs the mutation. The response is standard JSON. Because a Bearer token is not sent automatically by a browser, the cookie-based forgery risk does not apply to this handler. A Route Handler that trusts a session cookie would need its own CSRF protection.
+
+Server Actions handle the same mutation for the web UI and share the underlying logic:
+
+```jsx
+'use server';
+
+export async function addToCart(productId, quantity) {
+  const session = await getSession(); // cookie-based session for the web UI
+  if (!session) throw new Error('Unauthorized');
+
+  const parsedItem = cartItemSchema.parse({ productId, quantity });
+  await addToCartCore(parsedItem.productId, parsedItem.quantity, session.userId);
+  revalidatePath('/cart');
+}
+```
+
+Both call `addToCartCore`. The transport and the authentication differ for the two callers, and the mutation is the same.
+</Answer>
+
+---
+
+### Self-Test
+
+<Question>
+**Q1.** A team is building a Next.js application with a web UI and a public REST API that third-party developers will use. How should they structure their mutations?
+</Question>
+
+<Answer>
+Use Server Actions for mutations that start in the web UI and Route Handlers for the public REST API. Both call the same service layer, which holds the business logic and the validation.
+
+```js
+// lib/products-service.js
+export async function createProduct(input, userId) {
+  const validatedProduct = productSchema.parse(input);
+  return db.products.create({ data: { ...validatedProduct, createdBy: userId } });
+}
+```
+
+The Server Action authenticates with the session cookie and calls the service:
+
+```jsx
+// app/actions.js
+'use server';
+
+import { createProduct } from '@/lib/products-service';
+
+export async function createProductAction(input) {
+  const session = await getSession();
+  if (!session) throw new Error('Unauthorized');
+
+  const product = await createProduct(input, session.userId);
+  revalidatePath('/products');
+  return { id: product.id };
+}
+```
+
+The Route Handler authenticates with an API key or token and calls the same service:
+
+```jsx
+// app/api/v1/products/route.js
+import { createProduct } from '@/lib/products-service';
+
+export async function POST(request) {
+  const apiUser = await verifyApiKey(request.headers.get('x-api-key'));
+  if (!apiUser) return new Response('Unauthorized', { status: 401 });
+
+  const product = await createProduct(await request.json(), apiUser.id);
+  return Response.json({ id: product.id }, { status: 201 });
+}
+```
+
+The service layer is the single source of truth for business logic, so validation and ownership rules cannot drift apart between the two callers. What differs is the authentication (session cookie for the web, key or token for outside clients) and the transport (Server Action protocol versus standard HTTP with JSON). API keys should be stored hashed and compared in constant time, and the public API needs its own concerns such as versioning, rate limiting, and documentation, which Server Actions never had to provide.
+</Answer>
+
+---
+
+<Question>
+**Q2.** A developer needs to receive webhooks from a payment processor. Give three reasons why a Server Action cannot fulfill this requirement.
+</Question>
+
+<Answer>
+First, a Server Action is not a supported interface for outside callers. Its ID is generated by the build and changes with new builds, and the request it expects is React's internal serialization format, sent with a `Next-Action` header. A payment processor has no way to learn the ID and no way to build such a request. Even a hand-made `POST` that worked today would stop working after the next deployment.
+
+Second, the sender controls the request and you do not. A webhook provider sends its own fixed payload to a URL you register, with its own method and its own headers, such as `Stripe-Signature` for Stripe or `X-Hub-Signature-256` for GitHub. A Server Action gives you no way to choose that URL or method, and no way to make the provider send what the action expects.
+
+Third, an action cannot do what webhook handling requires. Signature verification needs the raw, unmodified request body plus the signature header, and a Server Action receives already-decoded arguments instead of the raw body. The provider also expects a specific response: Stripe treats any non-2xx status as a failed delivery and retries it. A Server Action returns a serialized value and cannot return a `Response` with a chosen status code and body.
+
+Server Actions can read incoming headers with `headers()`, but that does not change the picture, because the sender cannot get a request to the action in the first place. A Route Handler receives the `Request` directly, so `request.text()` gives the raw body, `request.headers` gives the signature, and the returned `Response` sets the status the provider expects.
+</Answer>
+
+---
+
+<Question>
+**Q3.** A Server Component needs to display product data that is also exposed through a `GET` Route Handler. Should the Server Component call the Route Handler, or access the data directly?
+</Question>
+
+<Answer>
+Access the data directly. The Server Component already runs on the server. Calling the Route Handler makes an HTTP request from your server to itself. Next.js documents the cost: a server-side `fetch` needs an absolute URL, so it is a real round trip. For a page that is prerendered at build time, the request fails the build, because no server is listening. For a page rendered on demand, it is slower because of the extra round trip between the handler and the render process.
+
+The correct pattern is a shared data access function:
+
+```js
+// lib/products.js
+export async function getProducts({ page = 1, pageSize = 20 } = {}) {
+  return db.products.findMany({ skip: (page - 1) * pageSize, take: pageSize });
+}
+```
+
+The Server Component calls it directly:
+
+```jsx
+import { getProducts } from '@/lib/products';
+
+async function ProductList() {
+  const products = await getProducts();
+  return <ul>{products.map((product) => <li key={product.id}>{product.name}</li>)}</ul>;
+}
+```
+
+The Route Handler calls the same function for external consumers:
+
+```jsx
+import { getProducts } from '@/lib/products';
+
+export async function GET() {
+  const products = await getProducts();
+  return Response.json({ data: products });
+}
+```
+
+There is a common objection: "but I lose caching, because the Data Cache applies to `fetch`." That is not a reason to make an HTTP call to yourself. Calls that do not use `fetch` can be cached too: wrap a function with `unstable_cache` (or use the `use cache` directive if you have Cache Components enabled) to cache its result, and wrap it with React's `cache()` to deduplicate it within one render. Calling a Route Handler from a Server Component is only reasonable when the endpoint is a different service that you genuinely have to reach over HTTP.
+</Answer>

@@ -1,0 +1,508 @@
+---
+title: "The Script component and font optimization"
+category: "nextjs"
+subcategory: "performance-primitives"
+order: 98
+---
+
+# The Script Component and Font Optimization
+
+## Exploring how next/script and next/font keep third-party code and web fonts from hurting your performance
+
+### 1. The Problem
+
+Two of the most common sources of poor web performance are things that seem unrelated to your application code: third-party JavaScript and web fonts. Both are added once and then forgotten. Both have non-obvious performance costs. Both have correct loading patterns that few teams follow unless a framework nudges them.
+
+A tag manager snippet added by the marketing team pulls in more scripts, and each one has to be downloaded, parsed, and executed on the same main thread that your own interface uses. A session-recording or chat widget can add tens to hundreds of kilobytes of JavaScript that the visitor never asked for, and it lands in the busiest part of the page load. A custom font loaded with a plain `@font-face` rule or a stylesheet link either leaves text invisible for a moment or shows it in a fallback font and then reflows the page when the real font arrives.
+
+These are not hard problems once you know the right approach. The difficulty is that the right approach depends on how browsers schedule scripts, prioritize resources, and handle fonts, which most developers do not think about until Core Web Vitals reports start showing problems.
+
+`next/script` and `next/font` make the good behavior the default. They give you an explicit way to say how urgent a script is, and they move font loading from a third-party network request to your own build.
+
+A note on routers: both features exist in the Pages Router (`pages/`) and the App Router (`app/`), with a few differences that this lesson points out where they matter.
+
+---
+
+### 2. The Naive Attempt
+
+A developer adds Google Analytics and a custom font to their Next.js application the way they would in any HTML project: directly in the root layout.
+
+```jsx
+// app/layout.js
+export default function RootLayout({ children }) {
+  return (
+    <html lang="en">
+      <head>
+        {/* Google Analytics */}
+        <script
+          src="https://www.googletagmanager.com/gtag/js?id=G-XXXXXXXX"
+          async
+        />
+        <script dangerouslySetInnerHTML={{
+          __html: `
+            window.dataLayer = window.dataLayer || [];
+            function gtag(){dataLayer.push(arguments);}
+            gtag('js', new Date());
+            gtag('config', 'G-XXXXXXXX');
+          `
+        }} />
+
+        {/* Google Fonts */}
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
+        <link
+          href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap"
+          rel="stylesheet"
+        />
+      </head>
+      <body>
+        {children}
+      </body>
+    </html>
+  );
+}
+```
+
+What this does to performance:
+
+The analytics script has `async`, so it does not block HTML parsing. But it starts downloading immediately, competes with your own JavaScript and images for the network, and executes the moment it arrives, interrupting whatever the main thread was doing. The developer has no control over when that happens, and the script is not there because the page needs it.
+
+A chat widget, added later by marketing through the tag manager, downloads on every page load. The visitor may never scroll to it, and the download and execution still happen during the busiest window.
+
+The font setup makes a request chain. The stylesheet comes from `fonts.googleapis.com`, and it is render-blocking: the browser will not paint the page until that CSS has arrived. The stylesheet then points to font files on a different host, `fonts.gstatic.com`, which needs its own connection. The two `preconnect` hints shorten the chain but do not remove it. Because the URL contains `display=swap`, the text shows in a fallback font first, and when the web font arrives the text is redrawn in it. If the fonts differ in width or height, the layout moves. Without `display=swap`, most browsers would instead hide the text for a short block period, up to about three seconds.
+
+---
+
+### 3. Why That Breaks
+
+Two categories of failure.
+
+**Third-party scripts: timing and main thread competition.**
+
+How a script tag behaves depends on its attributes. A script in the `<head>` with neither `async` nor `defer` blocks HTML parsing while it downloads and executes. An `async` script downloads in parallel and runs as soon as it arrives, whenever that is. A `defer` script runs after parsing finishes, before the `DOMContentLoaded` event. None of these mean "after the page is visible and the user can interact." All of them can land during the initial load.
+
+The metrics affected are Total Blocking Time (TBT), the lab measure of how long long tasks keep the main thread busy, and Interaction to Next Paint (INP), the field metric of how quickly the page responds to user input. INP replaced First Input Delay as a Core Web Vital on March 12, 2024, and TBT is widely used as a lab proxy for it. (Time to Interactive, an older metric you may see in articles, was removed from Lighthouse 10.) Long third-party scripts running during load are a leading cause of high TBT.
+
+**Fonts: render-blocking requests and layout shift.**
+
+A font loaded through a stylesheet link involves a cross-origin request chain, and the stylesheet itself is render-blocking. Once the font arrives, the browser swaps it in. What happens in the meantime is controlled by `font-display`. With `auto`, which most browsers treat like `block`, the text is invisible for a short block period, usually around three seconds (Flash of Invisible Text, or FOIT). With `swap`, the text shows immediately in a fallback font (Flash of Unstyled Text, or FOUT).
+
+FOUT trades invisible text for a visible change, and that change is where layout shift comes from. If the fallback font has different character widths and line heights than the web font, text reflows when the font applies. A heading that took three lines in the fallback font may take four in the web font and push everything below it down. That is a Cumulative Layout Shift (CLS) problem.
+
+---
+
+### 4. Next.js's Mental Model
+
+`next/script` controls when third-party scripts load relative to the page's own code and its hydration. You declare a strategy, and Next.js decides where and how the script is inserted. Where you write the component in your JSX is mostly irrelevant to when the script loads. The strategy decides that.
+
+`next/font` moves font loading from the network to the build. The font files are downloaded when you build, stored with your other static assets, and served from your own domain. At runtime the browser makes no request to a font provider, and Next.js generates a matched fallback font so the swap causes little or no layout shift.
+
+One sentence each:
+
+`next/script`: declare how urgent a script is, and Next.js loads it at the matching point in the page lifecycle, keeping non-essential third-party code out of the critical path.
+
+`next/font`: download and self-host fonts at build time and generate a metric-matched fallback, which removes the third-party request chain and most of the layout shift from font loading.
+
+---
+
+### 5. Next.js's Solution
+
+**The `next/script` component.**
+
+`next/script` replaces `<script>` tags, and its main feature is the `strategy` prop. There are four strategies:
+
+| Strategy | When it loads | Typical use |
+| --- | --- | --- |
+| `beforeInteractive` | Injected into the initial server HTML, fetched before any Next.js code and before hydration | Bot detection, cookie consent managers |
+| `afterInteractive` (default) | Injected on the client, early, but after some hydration | Tag managers, analytics |
+| `lazyOnload` | Injected on the client during browser idle time, after the page's resources have loaded | Chat widgets, social media widgets |
+| `worker` (experimental) | Loaded in a web worker with Partytown | Advanced use only |
+
+A root layout using the three stable strategies looks like this. Note that the chat widget lives in its own Client Component, because the `onLoad` handler that it uses is only allowed in Client Components:
+
+```jsx
+// app/layout.js  (a Server Component)
+import Script from 'next/script';
+import ChatWidget from './chat-widget';
+
+export default function RootLayout({ children }) {
+  return (
+    <html lang="en">
+      <body>
+        {children}
+
+        {/* Analytics: needed soon, but not before the page is usable */}
+        <Script
+          src="https://www.googletagmanager.com/gtag/js?id=G-XXXXXXXX"
+          strategy="afterInteractive"
+        />
+        <Script id="ga-init" strategy="afterInteractive">
+          {`
+            window.dataLayer = window.dataLayer || [];
+            function gtag(){dataLayer.push(arguments);}
+            gtag('js', new Date());
+            gtag('config', 'G-XXXXXXXX');
+          `}
+        </Script>
+
+        {/* Chat widget: loaded when the browser is idle */}
+        <ChatWidget />
+
+        {/* Root layout only: always injected into the <head> of the initial HTML */}
+        <Script
+          src="https://cdn.example.com/consent-manager.js"
+          strategy="beforeInteractive"
+        />
+      </body>
+    </html>
+  );
+}
+```
+
+```jsx
+// app/chat-widget.js
+'use client';
+
+import Script from 'next/script';
+
+export default function ChatWidget() {
+  return (
+    <Script
+      src="https://chat-widget.example.com/widget.js"
+      strategy="lazyOnload"
+      onLoad={() => {
+        window.ChatWidget?.boot({ appId: 'YOUR_APP_ID' });
+      }}
+    />
+  );
+}
+```
+
+**`beforeInteractive`.**
+
+The script is injected into the initial HTML that the server sends, downloaded before any Next.js module, and executed in the order the scripts appear. It is preloaded and fetched ahead of your first-party code, but its execution does not block hydration. In the App Router, `beforeInteractive` scripts must be placed in a root layout (for example `app/layout.js` or `app/[locale]/layout.js`), and they are injected into the `<head>` wherever you write them. They run once per document load: a client-side navigation does not run them again. In the Pages Router, they belong in `pages/_document.js`.
+
+The Next.js documentation says this strategy is only for critical scripts that need to be fetched as soon as possible, and gives bot detectors and cookie consent managers as examples. The cost is priority: a `beforeInteractive` script takes the front of the network queue ahead of your own JavaScript, so use it sparingly. The `onLoad` and `onError` handlers do not work with it; the documentation suggests `onReady` instead.
+
+Also remember that a consent manager loading early is not the same as consent being enforced. Whether other tags are held back until the visitor decides is a matter of how the consent tool and your tags are configured, for example through consent settings in your tag manager.
+
+**`afterInteractive`.**
+
+This is the default. The script is injected on the client after some hydration has happened, so your first-party code gets to the front of the queue first. It is the right strategy for analytics and tag managers: the page is visible and usable before the script starts, and events fired before the script has loaded are not lost, because the `dataLayer` array queues them and the analytics library processes the queue when it starts. An `afterInteractive` script can be placed in any page or layout, and it only loads when a route that renders it is opened.
+
+`afterInteractive` still runs on the main thread when it executes, so a heavy script can still add to TBT and INP. That is why scripts that are not needed early belong in the next strategy.
+
+**`lazyOnload`.**
+
+The script is injected on the client during browser idle time, after the page's resources have loaded. Internally it waits for the window `load` event (or runs right away if the document has already finished loading) and then asks the browser for an idle moment with `requestIdleCallback`. This suits chat support widgets, social media widgets, and other scripts with no urgency.
+
+**Running code after a script loads.**
+
+Three event props let you react to a script's lifecycle:
+
+- `onLoad` runs once, after the script has finished loading.
+- `onReady` runs after the script has loaded and again every time the component re-mounts, for example after a client-side navigation. It suits scripts that must re-initialize on each mount, such as a map embed.
+- `onError` runs if the script fails to load.
+
+All three only work inside Client Components (`'use client'`). Placing them on a `Script` in a Server Component, such as the root layout above, is an error, which is why the chat widget has its own file.
+
+**Inline scripts.**
+
+Inline JavaScript is supported by writing it as a template string child or through `dangerouslySetInnerHTML`. It must have an `id`, so Next.js can track and deduplicate it:
+
+```jsx
+<Script id="show-banner">
+  {`document.getElementById('banner').classList.remove('hidden')`}
+</Script>
+```
+
+Only put fixed strings in inline scripts, never user input, because they run with full page privileges. If your site uses a Content Security Policy, pass `nonce` and any other attributes you need to the `Script` component. It forwards attributes it does not use itself to the final `<script>` element.
+
+**Where the script is placed: layouts and pages.**
+
+A script in the root layout is available on every route. A script in a nested layout is fetched when any route under that layout is opened, and a script in a page is fetched when that page is opened. In all cases Next.js loads a given script only once, even when the user navigates between the routes that render it, and it does not remove the script again when they leave. The documentation recommends including third-party scripts only on the pages or layouts that need them, to limit unnecessary performance impact.
+
+**The official shortcut: `@next/third-parties`.**
+
+For the most common Google integrations there is a library that does this loading for you. `@next/third-parties/google` provides `GoogleAnalytics`, `GoogleTagManager`, `YouTubeEmbed`, and `GoogleMapsEmbed` components. By default the analytics and tag manager components load their scripts after hydration.
+
+```jsx
+// app/layout.js
+import { GoogleAnalytics } from '@next/third-parties/google';
+
+export default function RootLayout({ children }) {
+  return (
+    <html lang="en">
+      <body>{children}</body>
+      <GoogleAnalytics gaId="G-XYZ" />
+    </html>
+  );
+}
+```
+
+The library is marked experimental in the Next.js documentation, which recommends installing it with the `latest` tag. If Google Tag Manager is already on your site, the documentation recommends configuring Google Analytics inside it instead of adding a separate component.
+
+**Pages Router differences for scripts.**
+
+| Topic | Pages Router | App Router |
+| --- | --- | --- |
+| `beforeInteractive` placement | `pages/_document.js` | A root layout |
+| `worker` strategy | Supported (experimental, needs `experimental.nextScriptWorkers` and Partytown) | Not supported yet |
+| Event handlers (`onLoad`, `onReady`, `onError`) | Fine in ordinary page components | Only inside Client Components |
+
+**The `next/font` system.**
+
+`next/font` takes a different approach from a font stylesheet on a font provider's CDN or a hand-written `@font-face`. CSS and font files are downloaded at build time and served with the rest of your static assets from your own domain. The documentation states that no requests are sent to Google by the browser.
+
+```jsx
+// app/layout.js
+import { Inter, Roboto_Mono } from 'next/font/google';
+
+// Inter is a variable font, so no weight is needed
+const inter = Inter({
+  subsets: ['latin'], // the subset to preload
+  display: 'swap', // this is also the default
+  variable: '--font-inter', // CSS variable for use in stylesheets
+});
+
+const robotoMono = Roboto_Mono({
+  subsets: ['latin'],
+  display: 'swap',
+  variable: '--font-roboto-mono',
+});
+
+export default function RootLayout({ children }) {
+  return (
+    <html lang="en" className={`${inter.variable} ${robotoMono.variable}`}>
+      <body className={inter.className}>{children}</body>
+    </html>
+  );
+}
+```
+
+Some rules from the documentation:
+
+- Variable fonts are recommended for the best performance and flexibility, and they do not need a `weight`. A font that is not variable needs one, as in `Roboto({ weight: ['400', '700'], subsets: ['latin'] })`.
+- Name fonts with several words with an underscore: `Roboto Mono` is imported as `Roboto_Mono`.
+- `display` defaults to `'swap'`. The other values are `'auto'`, `'block'`, `'fallback'`, and `'optional'`.
+- `subsets` chooses which subsets are preloaded. If `preload` is true (the default) and no subset is given, you get a warning.
+- Fonts are scoped to where they are used. To apply a font to the whole application, apply it in the root layout.
+- Each call to a font function hosts one instance of that font in your application. If you need the same font in several places, define it once in a shared file and import that object.
+- Use multiple fonts sparingly, since every extra font is another resource to download.
+
+What happens at build time:
+
+1. Next.js reads the font configuration.
+2. It downloads the Google CSS and the font files (during your build, not when a visitor arrives).
+3. It stores the files with your other static assets, typically under `/_next/static/media`.
+4. It generates the `@font-face` CSS that points to those local files.
+5. It generates a fallback font with adjusted metrics, unless you turn that off with `adjustFontFallback: false`.
+
+At runtime, the browser requests the fonts from your own domain. There is no DNS lookup, connection, or TLS handshake with a font provider.
+
+**Preloading.**
+
+A font is only preloaded on the routes where it is used. If the font is used in a single page, it is preloaded on that page's route. If it is used in a layout, it is preloaded on all routes that layout wraps. If it is used in the root layout, it is preloaded on all routes. This is why importing a font object only where you need it keeps other pages lighter.
+
+**Automatic fallback metrics: how layout shift is reduced.**
+
+Layout shift from fonts happens because the fallback font (Arial, Times New Roman) has different character widths and vertical metrics from the web font. When the web font replaces it, text reflows. `next/font` generates a fallback `@font-face` that uses a local system font and CSS descriptors (`size-adjust`, `ascent-override`, `descent-override`, `line-gap-override`) to make it occupy nearly the same space as the web font:
+
+```css
+/* Generated by next/font (the numbers here are illustrative) */
+@font-face {
+  font-family: '__Inter_Fallback_abc123';
+  src: local('Arial');
+  ascent-override: 90%;
+  descent-override: 22%;
+  line-gap-override: 0%;
+  size-adjust: 107%;
+}
+```
+
+When Inter loads and replaces this fallback, the two fonts take up approximately the same room, so the layout barely moves. The letter shapes still change, which you can see, but the shift in layout is small. The option is called `adjustFontFallback`: for Google fonts it is a boolean and defaults to `true`, and for local fonts it is `'Arial'` (the default), `'Times New Roman'`, or `false`.
+
+**Local fonts.**
+
+For fonts that are not on Google Fonts, such as licensed brand fonts:
+
+```jsx
+import localFont from 'next/font/local';
+
+const brandFont = localFont({
+  src: [
+    { path: './fonts/brand-regular.woff2', weight: '400', style: 'normal' },
+    { path: './fonts/brand-bold.woff2', weight: '700', style: 'normal' },
+  ],
+  variable: '--font-brand',
+  display: 'swap',
+});
+```
+
+The path is resolved relative to the file where `localFont` is called, so the font files can sit next to your code inside `app`, or anywhere else in the project, including `public`. Local fonts are self-hosted like Google fonts and get the same kind of automatic fallback adjustment.
+
+`next/font` also works in the Pages Router. There you call the font functions in `pages/_app.js` (or in individual pages) and apply the class names there.
+
+---
+
+### 6. Internals
+
+**How `next/script` implements each strategy.**
+
+The behavior below is read from the Next.js source. It is simplified, and the details can change between versions.
+
+- `afterInteractive`: the script is loaded from inside an effect in the component. Effects run on the client after render, so the script is fetched after hydration has started. It does not run during server rendering.
+- `lazyOnload`: the component waits for the window `load` event, or acts immediately if `document.readyState` is already `complete`, and then calls `requestIdleCallback` to load the script.
+- `beforeInteractive` (App Router): the component renders a tiny inline script that pushes the script's details onto a global queue, `self.__next_s`. The Next.js runtime reads that queue and loads the scripts before any Next.js code and before hydration. The script is placed in the `<head>`.
+- `beforeInteractive` (Pages Router): the script is registered with the document so it is written into the HTML that `_document` produces.
+- `worker`: the script gets `type="text/partytown"` and is run by Partytown in a web worker.
+
+**Deduplication.**
+
+Two internal caches track scripts. One is keyed by `src` and holds the loading promise for external scripts. The other is keyed by `id` when there is one, otherwise by `src`, and records which scripts have been loaded. If the same script shows up again, for example because a component re-mounts or because two pages render it, Next.js does not load it a second time. There is no cleanup code: scripts stay in the DOM after the user leaves the page that added them. On a re-mount of an already-loaded script, `onReady` runs again, while `onLoad` does not.
+
+**How `next/font` computes fallback metrics.**
+
+For Google fonts, Next.js uses precomputed metrics from a table of font data (the metrics library called Capsize) instead of reading the font file. For local fonts, it reads the file at build time with the `fontkit` library and collects `ascent`, `descent`, `lineGap`, `unitsPerEm`, and an average character width. It measures the width with a string of letters chosen to reflect how often each letter appears in English text, including spaces. The fallback candidates are Arial for sans-serif fonts and Times New Roman for serif fonts, and their metrics are stored in the source.
+
+The math, simplified:
+
+```js
+// Simplified from the Next.js source
+const webFontAvgWidth = webFont.averageWidth / webFont.unitsPerEm;
+const fallbackAvgWidth = fallback.averageWidth / fallback.unitsPerEm;
+
+// How much to scale the fallback so its average letter width matches
+const sizeAdjust = webFontAvgWidth / fallbackAvgWidth;
+
+// Vertical metrics are divided by the same scale, because size-adjust also scales them
+const ascentOverride = webFont.ascent / (webFont.unitsPerEm * sizeAdjust);
+const descentOverride = Math.abs(webFont.descent) / (webFont.unitsPerEm * sizeAdjust);
+const lineGapOverride = webFont.lineGap / (webFont.unitsPerEm * sizeAdjust);
+```
+
+Each value is written as a percentage with two decimals. The result is static CSS included with your build. Nothing is calculated when a visitor loads the page.
+
+The match is approximate: an average width is a statistical stand-in for the real text, so a particular sentence may still be slightly wider or narrower in the fallback than in the web font. That is why the layout shift is described as reduced, not always zero.
+
+---
+
+### 7. Interview Traps
+
+<Question>
+**Trap 1: A developer uses `strategy="beforeInteractive"` for Google Analytics because "analytics must track from the very first moment." What is the performance impact, and is the reasoning correct?**
+</Question>
+
+<Answer>
+The reasoning is incorrect, and it has a cost.
+
+The Next.js documentation describes `beforeInteractive` as a strategy for critical scripts that need to be fetched as soon as possible, and names bot detectors and cookie consent managers as examples. Such scripts are injected into the initial HTML, preloaded, and downloaded before any of your own Next.js code. Their execution does not block hydration, but they do take the front of the network queue and run early. For analytics, that means competing with your own JavaScript for bandwidth for no benefit.
+
+The benefit the developer wants, capturing the first page view, does not need an early script. Analytics libraries are built around a queue: the `dataLayer` array collects calls such as `gtag('js', new Date())` and `gtag('config', 'G-XXXXXXXX')` even before the library has loaded, and the library processes the queue when it starts. Loading the script with `afterInteractive` still records the page load correctly. The docs list tag managers and analytics as the typical use of `afterInteractive`.
+
+Two practical points. The `onLoad` handler does not work with `beforeInteractive`, so the initialization pattern from the layout example (an inline script that fills `dataLayer`) is the safe way to set up analytics in any case. And if you use Google Analytics or Tag Manager, `@next/third-parties/google` already loads them after hydration with the right structure, so you do not have to hand-write any of this.
+
+`beforeInteractive` fits scripts that must exist before your page code, such as a bot detector or a consent manager. Analytics is not one of them.
+</Answer>
+
+---
+
+<Question>
+**Trap 2: A developer says "I'll just use Google Fonts with a `<link rel="preconnect">` instead of `next/font`, it's simpler." What does `next/font` provide that this approach does not?**
+</Question>
+
+<Answer>
+Three things.
+
+First, no request to a third party at all. `next/font` downloads the fonts when you build, and your own domain serves them, so a visitor's browser never contacts Google for fonts. `preconnect` shortens the connection setup to Google's servers but does not remove it. The stylesheet still comes from `fonts.googleapis.com`, the files from `fonts.gstatic.com`, and both depend on those services being reachable and fast for that visitor. One more thing has changed: browsers now partition their HTTP cache per site (Chrome since version 86 in October 2020, Safari earlier, Firefox since early 2021), so a font that another site already loaded from Google's CDN is no longer reused. The old argument that a shared CDN font is probably already cached no longer holds.
+
+Second, automatic fallback metrics. `next/font` generates a fallback `@font-face` with `size-adjust` and the other override descriptors, so the swap from fallback to web font moves the layout very little. You can do this by hand, since the descriptors are standard CSS, but you would have to read the font's metrics and calculate the values yourself for every font. Loading Google Fonts through a link gives you none of this automatically.
+
+Third, privacy. Loading fonts from Google's servers sends each visitor's IP address, User-Agent, and referring page to Google as a side effect of the font request. Self-hosting avoids that transfer for fonts (Q3 explains why some teams care).
+
+There is a fourth, smaller benefit: `next/font` preloads a font only on the routes that use it, so a font used by one page does not add weight to every other page.
+</Answer>
+
+---
+
+<Question>
+**Trap 3: Can `next/script` be used inside a page component, not only in the layout? What is the difference in behavior, and is a script removed when the user navigates away?**
+</Question>
+
+<Answer>
+Yes. `next/script` can be used in layouts, pages, and other components. The differences are in scope and in one restriction.
+
+Scope: a script in the root layout is available on every route. A script in a nested layout is fetched when the user first opens a route under that layout. A script in a page is fetched when that page is opened. Next.js loads a given script only once, even if the user navigates between several routes that render it.
+
+Scripts are not removed on navigation. Next.js has no cleanup that takes a script out of the page, and it remembers which scripts it has loaded (by `id`, or by `src` when there is no `id`) so it does not load them twice. If a component that renders a script mounts again, the script is not reloaded. `onLoad` does not run again either, but `onReady` does, which is why `onReady` is the right prop for code that must re-initialize on every mount.
+
+The restriction: `beforeInteractive` scripts must be placed in a root layout in the App Router, because they are injected into the initial HTML for the whole document. That rules out putting a `beforeInteractive` script in a checkout page. A page-specific script such as Stripe.js on a checkout page should use `afterInteractive` (or `lazyOnload`):
+
+```jsx
+// app/checkout/page.js
+import Script from 'next/script';
+import CheckoutForm from './checkout-form';
+
+export default function CheckoutPage() {
+  return (
+    <div>
+      {/* Only fetched when /checkout is opened */}
+      <Script src="https://js.stripe.com/v3/" strategy="afterInteractive" />
+      <CheckoutForm />
+    </div>
+  );
+}
+```
+
+The form needs to wait until the library exists before it uses it. Because handlers like `onLoad` and `onReady` only work in Client Components, put that logic in a Client Component such as `CheckoutForm`, or load the library on demand from your own code.
+</Answer>
+
+---
+
+### Self-Test
+
+<Question>
+**Q1.** What are the three stable `next/script` strategies, and where in the page lifecycle does each one load a script?
+</Question>
+
+<Answer>
+`beforeInteractive`: the script is injected into the initial server-rendered HTML, in the `<head>`. It is downloaded before any Next.js code and before hydration, and it runs in the order the scripts appear. Its execution does not block hydration, but it takes priority over your own code for the network. It is for critical scripts such as bot detectors and cookie consent managers, and in the App Router it must live in a root layout.
+
+`afterInteractive` (the default): the script is injected on the client, from an effect, after some hydration has occurred. Your own code loads first, and the script follows as soon as possible. It is the right strategy for analytics and tag managers, and it can be placed in any page or layout.
+
+`lazyOnload`: the script is injected on the client after the window `load` event, when the browser is idle (via `requestIdleCallback`). It is for scripts with no urgency, such as chat widgets and social media widgets.
+
+There is also `worker`, which is experimental and only works in the Pages Router.
+</Answer>
+
+---
+
+<Question>
+**Q2.** What are FOUT and FOIT, and how do `display: 'swap'` and the automatic fallback metrics of `next/font` address them?
+</Question>
+
+<Answer>
+FOIT (Flash of Invisible Text) happens when the browser hides text while the web font loads, then shows it when the font arrives. With `font-display: auto`, which most browsers treat like `block`, this block period is usually around three seconds. Visitors stare at empty space where the text should be.
+
+FOUT (Flash of Unstyled Text) happens when the browser shows the text at once in a fallback font and swaps to the web font when it loads. This is what `font-display: swap` does. The text is always readable, but its appearance changes when the swap happens.
+
+`next/font` defaults to `display: 'swap'`, which chooses FOUT over FOIT, because visible text is better for perceived performance. (`'optional'` avoids the visible swap altogether: the browser only uses the web font if it is available almost immediately.)
+
+The swap can cause layout shift, since the two fonts occupy different amounts of space. `next/font` addresses that by generating a fallback `@font-face` that uses a local system font with `size-adjust`, `ascent-override`, `descent-override`, and `line-gap-override`. Then the fallback occupies close to the same space as the web font, so when the swap happens the text mostly stays in place. FOUT is still visible, because the letter shapes change, but the layout shift is small. It is reduced rather than guaranteed to be zero, since the match is based on an average width.
+</Answer>
+
+---
+
+<Question>
+**Q3.** Why does `next/font` avoid the privacy concerns associated with loading fonts from Google, and how should a team think about the legal side?
+</Question>
+
+<Answer>
+When a page loads fonts through a stylesheet link to Google's servers, each visitor's browser sends requests directly to Google. Those requests carry the visitor's IP address, the User-Agent, and the address of the referring page, as with any HTTP request. Google receives them for every page view that uses the fonts, whether or not the visitor interacts with anything.
+
+`next/font` downloads the CSS and font files once at build time, on your build machine, and serves them from your own domain. The browser requests them from your site, not from Google, so no visitor data is sent to Google because of fonts.
+
+On the legal side, be careful and hedge. In January 2022, the Regional Court of Munich I (case 3 O 17493/20) awarded a website visitor 100 euros in damages because the site had loaded Google Fonts from Google's servers, which transmitted the visitor's IP address to Google without consent. The decision was widely reported and was followed by a wave of warning letters demanding settlements. Later German courts, including Baden-Baden in 2022 and Ludwigsburg and Munich in 2023, rejected mass claims of that kind as an abuse of rights. So the law in this area is contested and depends on the jurisdiction, and this lesson is not legal advice. If it matters for your product, ask your legal team.
+
+The engineering point holds no matter how those cases are decided. With self-hosted fonts, the browser never contacts Google for fonts, so there is no transfer to disclose or defend for that request, and font loading no longer depends on Google's servers being reachable.
+</Answer>
