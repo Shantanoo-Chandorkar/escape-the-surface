@@ -1,0 +1,481 @@
+---
+title: "The Image component"
+category: "nextjs"
+subcategory: "performance-primitives"
+order: 97
+---
+
+# The Image Component
+
+## Exploring what the native img tag leaves to you, what next/image automates, and where it still needs your help
+
+### 1. The Problem
+
+Images are the largest contributor to page weight and a common cause of poor Core Web Vitals scores. In the HTTP Archive's 2025 Web Almanac, the median home page ships roughly 0.9 MB (mobile) to 1.1 MB (desktop) of images. That is about a third of all bytes on the page, more than any other type of resource.
+
+The typical failures are easy to recognize. A 4000×3000 pixel photo is served to a phone that displays it at 400×300. A photo that could be a fraction of the size in a modern format is served as a large PNG. Images below the fold download immediately and compete for the network with the image the user is actually looking at. Images without dimensions push the page around as they load, which drives up Cumulative Layout Shift.
+
+Every one of these problems is solvable, and none of them is solved by the native `<img>` tag. The native tag is a transport mechanism: it fetches a URL and displays it. Sizing, format conversion, loading priority, and layout shift prevention are the developer's responsibility.
+
+In practice, most developers do not handle most of these. The images shipped are whatever size the designer exported. The format is JPEG or PNG because that is what the export dialog produces. Lazy loading is added inconsistently. Dimensions are omitted on many images.
+
+`next/image` automates most of this at the framework level. It resizes and re-encodes images on demand, negotiates the format per browser, lazy loads by default, and requires the information the browser needs to reserve space. It does not do everything: it cannot know which of your images is the most important one on the page, and it needs you to describe how wide the image is at different screen sizes. Those two jobs remain yours.
+
+A note on routers: `next/image` works in both the Pages Router (`pages/`) and the App Router (`app/`). The component and the optimization endpoint behind it are the same in both. The older pre-13 API still exists as `next/legacy/image`.
+
+---
+
+### 2. The Naive Attempt
+
+A developer builds a product catalog. Each product has a hero image at 1200×800 pixels, uploaded by the marketing team as a PNG:
+
+```jsx
+function ProductCard({ product }) {
+  return (
+    <div className="card">
+      <img src={product.imageUrl} alt={product.name} />
+      <h2>{product.name}</h2>
+      <p>${product.price}</p>
+    </div>
+  );
+}
+```
+
+What the browser receives for a page with 12 product cards (illustrative numbers for photos exported this way):
+
+- 12 PNG images, each somewhere around 800 KB to 1.2 MB
+- Total image transfer of roughly 9 to 14 MB for one page
+- Images 3 through 12 are below the fold but download immediately
+- Image 1, the one above the fold, competes for bandwidth with images 8 through 12, which nobody can see
+- Every card shifts the layout when its image arrives, because no `width` or `height` is set
+- On a 390px-wide phone each image is displayed at about 370 CSS pixels wide but downloaded at 1200 pixels
+- One file cannot be right for every screen. A 3x phone can use up to about 1100 physical pixels for that 370px slot, while a 1x desktop monitor needs only 370. A single fixed file is too big for one and too small for the other
+
+The developer makes some improvements:
+
+```jsx
+<img
+  src={product.imageUrl}
+  alt={product.name}
+  width={600}
+  height={400}
+  loading="lazy"
+/>
+```
+
+Better. The explicit dimensions let the browser reserve space, and images below the fold are lazy loaded. But the problems that remain are real:
+
+- Still serving a 1200×800 PNG into a 600×400 slot, four times the pixels the slot needs on a 1x screen
+- Still serving PNG when WebP would be markedly smaller
+- Still serving the same file to a phone and a desktop
+- The first image, the one above the fold that decides the Largest Contentful Paint, is now `loading="lazy"`, which delays it
+
+One improvement created a new problem. Getting priorities right by hand is not trivial.
+
+---
+
+### 3. Why That Breaks
+
+Four independent failure modes, each measurable in Core Web Vitals.
+
+**Failure mode 1: wrong image dimensions for the display size.**
+
+The browser decodes an image at its native pixel dimensions, whatever size it is displayed at. A decoded bitmap takes roughly four bytes per pixel, so a 1200×800 image occupies about 3.8 MB in memory, a 600×400 image about 0.96 MB, and a 300×200 image about 0.24 MB. Serving the 1200×800 file into a 300×200 slot costs 16 times the memory, and the download is many times larger than needed.
+
+**Failure mode 2: wrong image format.**
+
+WebP files are usually 25 to 35 percent smaller than their JPEG and PNG counterparts, according to Google's guidance on web.dev. AVIF compresses smaller still: the Next.js documentation says about 20 percent smaller than WebP, at the cost of roughly 50 percent longer encoding time. JPEG and PNG are still the default output of most design tools and CMS uploads, so serving them unchanged wastes bandwidth.
+
+**Failure mode 3: wrong loading priority.**
+
+`loading="lazy"` defers an image until it is near the viewport. Applied to the Largest Contentful Paint image, it adds delay by design. The web.dev guidance is direct: never lazy load your LCP image. Applied to no images, everything competes for the same bandwidth at once. The image that matters should be discovered and fetched early, and everything else should wait its turn. That requires knowing the layout, which a generic tag cannot know.
+
+**Failure mode 4: missing dimensions cause layout shift.**
+
+Without `width` and `height` attributes, the browser does not know how much space to reserve before the image loads. When the image arrives, the content around it moves. This is measured as Cumulative Layout Shift (CLS), one of the Core Web Vitals, which feed into Google's page experience signals.
+
+---
+
+### 4. Next.js's Mental Model
+
+`next/image` is two things working together. On the page, the component renders an `<img>` with the attributes the browser needs: `width` and `height` for layout, a `srcset` of candidate sizes, lazy loading by default, and a blur placeholder if you ask for one. On the server, a built-in optimization endpoint at `/_next/image` receives requests for a specific width and quality, fetches the original image, resizes and re-encodes it, and caches the result.
+
+The transformation happens on demand, at request time, not at build time. The browser asks for a specific optimized candidate. The original large file is never sent to it.
+
+One sentence: `next/image` renders an `<img>` whose `srcset` points at an on-demand optimization endpoint, so the browser downloads a correctly sized, correctly encoded, cached version of the image, while `width` and `height` let it reserve layout space in advance.
+
+---
+
+### 5. Next.js's Solution
+
+**Basic usage.**
+
+```jsx
+import Image from 'next/image';
+
+function ProductCard({ product }) {
+  return (
+    <div className="card">
+      <Image
+        src={product.imageUrl}
+        alt={product.name}
+        width={600}
+        height={400}
+      />
+      <h2>{product.name}</h2>
+    </div>
+  );
+}
+```
+
+What `next/image` does with this:
+
+1. Renders an `<img>` with `width="600"` and `height="400"` attributes so the browser can reserve the right amount of space.
+2. Generates a `srcset` with two candidates, one for 1x screens and one for 2x screens. It picks the nearest configured widths at or above 600 and above 1200, which with the default configuration are 640 and 1200.
+3. Sets `loading="lazy"` and `decoding="async"`. Lazy loading is the default for every image, because Next.js cannot know where the fold is. You opt an image out of it.
+4. When the browser requests a candidate, the `/_next/image` endpoint resizes the original to that width, re-encodes it (WebP by default for browsers that accept it), and caches the result.
+
+**What `width` and `height` mean.**
+
+They are the image's intrinsic size in pixels. Next.js uses them to work out the aspect ratio the browser reserves before the image loads, and to choose the `srcset` candidates. They do not set the rendered size: CSS controls that. If you use CSS to give the image a custom width, also set `height: 'auto'` so the aspect ratio is preserved. Both props are required unless the image is a static import or uses `fill`.
+
+**Marking the important image: `preload`, `loading="eager"`, and `fetchPriority`.**
+
+The Largest Contentful Paint element is usually an above-the-fold image, and it should not be lazy loaded. In Next.js 16 there are three ways to tell the browser:
+
+```jsx
+// Hero image: above the fold, the likely LCP element
+<Image
+  src={heroImage}
+  alt="Product hero"
+  width={1200}
+  height={600}
+  loading="eager"
+  fetchPriority="high"
+/>
+
+// Alternative: preload also inserts a <link rel="preload"> in the <head>.
+// Do not combine it with loading or fetchPriority.
+<Image src={heroImage} alt="Product hero" width={1200} height={600} preload />
+
+// Product card images: no extra props, so they default to loading="lazy"
+<Image src={product.image} alt={product.name} width={400} height={300} />
+```
+
+In Next.js 15 and earlier, the prop was named `priority`. Starting with Next.js 16, `priority` is deprecated in favor of `preload`, to make the behavior clearer. `preload` inserts a `<link rel="preload">` in the document `<head>` so the browser discovers the image early, and it also stops the image from being lazy loaded.
+
+The Next.js documentation recommends `preload` only when the image is clearly the LCP element and is above the fold. It advises against it when several images could be the LCP element depending on the viewport (a different hero on mobile and desktop, say). In most cases, it recommends `loading="eager"` or `fetchPriority="high"` instead. Adding a priority hint to the true LCP image is one of the most effective changes for LCP.
+
+**The `fill` prop for unknown dimensions.**
+
+When the image should fill its parent and you do not know its intrinsic size ahead of time (a user upload, a CMS image), use `fill`:
+
+```jsx
+function HeroBanner({ imageUrl }) {
+  return (
+    // The parent must be positioned: relative, fixed, or absolute
+    <div style={{ position: 'relative', height: '400px', width: '100%' }}>
+      <Image
+        src={imageUrl}
+        alt="Hero banner"
+        fill
+        sizes="100vw"
+        style={{ objectFit: 'cover' }} // CSS controls how the image fills the box
+        loading="eager"
+      />
+    </div>
+  );
+}
+```
+
+With `fill`, the image is absolutely positioned and sized against the nearest positioned ancestor, so the parent defines the box. `objectFit: 'cover'` crops, `'contain'` fits inside. No `width` or `height` props are needed. You should still provide `sizes`, as the next section explains.
+
+**The `sizes` prop for responsive images.**
+
+`sizes` describes how wide the image will be at different screen widths. It affects how the `srcset` is built:
+
+- Without `sizes`, Next.js generates a small `srcset` with 1x and 2x candidates. That suits images with a fixed size.
+- With `sizes`, Next.js generates a full `srcset` with width descriptors (640w, 750w, and so on), which suits responsive layouts.
+- If `sizes` is missing on a `fill` image, or on an image that CSS makes responsive, the browser assumes the image is as wide as the viewport (`100vw`), which can download far more than needed.
+
+```jsx
+<Image
+  src={product.image}
+  alt={product.name}
+  fill
+  sizes="(max-width: 768px) 100vw, (max-width: 1200px) 50vw, 33vw"
+  // Up to 768px wide screens: the image takes the full width
+  // 769 to 1200px: half the width
+  // Wider than 1200px: one third of the width
+/>
+```
+
+Next.js only generates the candidates. The browser chooses among them: it picks the smallest candidate that is at least as wide as the slot multiplied by the screen's pixel density. For a 1440px-wide desktop, the slot is one third of the viewport, about 475 CSS pixels. A 1x screen needs 475 pixels and picks the 640w candidate. A 2x screen needs 950 pixels and picks the 1080w candidate. A 390px-wide phone with a pixel density of 3 has a full-width slot and needs 1170 pixels, so it picks the 1200w candidate.
+
+**Remote images: `remotePatterns`.**
+
+For images hosted elsewhere, you must list which URLs the optimizer may fetch. The optimizer is a server-side fetcher, so an open configuration would let anyone use your server to download and process arbitrary URLs, and could expose internal network addresses (a server-side request forgery risk):
+
+```js
+// next.config.js
+module.exports = {
+  images: {
+    remotePatterns: [
+      {
+        protocol: 'https',
+        hostname: 'cdn.example.com',
+        port: '',
+        pathname: '/images/**', // only this path
+        search: '', // no query string
+      },
+      {
+        protocol: 'https',
+        hostname: '**.cloudinary.com', // subdomains of cloudinary.com
+      },
+    ],
+  },
+};
+
+// Since Next.js 15.3, URL objects are also accepted:
+// remotePatterns: [new URL('https://cdn.example.com/images/**')]
+```
+
+Be as specific as possible. When you omit `protocol`, `port`, `pathname`, or `search`, the wildcard `**` is implied, which the documentation says is not recommended. A request for a URL that matches no pattern is answered with `400 Bad Request` and the image does not display. The older `domains` option is deprecated since Next.js 14: it cannot restrict protocol, port, or path, and it does not support wildcards.
+
+Two more security notes from the documentation. Redirects from an allowed host are followed (up to `maximumRedirects`, 3 by default) and the redirect target is not checked against your patterns again, so set `maximumRedirects: 0` if you do not need redirects. And the default loader does not forward headers when fetching a source image, so images that need authentication must use `unoptimized`.
+
+**Placeholder blur for loading states.**
+
+```jsx
+import Image from 'next/image';
+import productImage from './product.jpg';
+// A static import gives Next.js the width, height, and a blurDataURL automatically
+
+function ProductCard() {
+  return (
+    <Image
+      src={productImage}
+      alt="Product"
+      placeholder="blur" // blurDataURL comes from the static import
+    />
+  );
+}
+```
+
+For a static import of a `jpg`, `png`, `webp`, or `avif` file (unless it is animated), `blurDataURL` is generated for you. For dynamic or remote images, you must supply a tiny `blurDataURL` yourself:
+
+```jsx
+<Image
+  src={product.imageUrl}
+  alt={product.name}
+  width={600}
+  height={400}
+  placeholder="blur"
+  blurDataURL={product.blurDataUrl} // a very small data URL, 10 pixels wide or less is recommended
+/>
+```
+
+The placeholder is inline data, so it needs no network request, and it is removed once the real image has loaded. A large `blurDataURL` hurts performance, so keep it tiny. `placeholder` also accepts a `data:image/...` URL directly, which is how shimmer effects are built.
+
+**When not to optimize: `unoptimized`.**
+
+Small images (under about 1 KB), vector images, and animated GIFs gain nothing from optimization. Set `unoptimized` on them to serve the file as is. It applies automatically when `src` ends in `.svg`. Serving SVG through the optimizer is off by default because SVG can carry scripts. `dangerouslyAllowSVG` turns it on, and the documentation strongly recommends pairing it with a restrictive `contentSecurityPolicy` and `contentDispositionType: 'attachment'`.
+
+---
+
+### 6. Internals
+
+**The image optimization endpoint.**
+
+When the browser requests a candidate, the request goes to Next.js's built-in optimizer:
+
+```
+/_next/image?url=%2Fproducts%2Fhero.jpg&w=640&q=75
+```
+
+The endpoint validates the request before it does any work:
+
+1. The `url` must match `localPatterns` (for local files) or `remotePatterns` (for remote ones). A protocol-relative URL (`//host/path`) or a recursive URL is rejected, and anything that does not match gets `400`.
+2. `w` must be one of the configured widths (`deviceSizes` plus `imageSizes`). With the default configuration `w=640` is valid and `w=600` is not: a request for a width outside the lists is refused with `400`.
+3. `q` must be a valid quality, and if `qualities` is configured it must be in that list. Since Next.js 16, `qualities` is required and defaults to `[75]`, so with the default configuration only quality 75 is served. The `quality` prop is coerced to the closest allowed value.
+
+After validation, the endpoint checks its cache. On a miss, it reads the original from disk or fetches the remote file (without forwarding your headers, following at most `maximumRedirects` redirects, and refusing sources over `maximumResponseBody`, 50 MB by default), resizes it to `w`, re-encodes it in the negotiated format at quality `q`, stores the result, and responds. Later requests for the same combination are served from the cache.
+
+**Caching.**
+
+Optimized images are written to disk under `<distDir>/cache/images` (`.next/cache/images` by default), and the least recently used files are removed when the cache exceeds `maximumDiskCacheSize`. How long an entry stays fresh is the larger of two values: `minimumCacheTTL` and the `Cache-Control` max-age of the upstream image. In Next.js 16 the default `minimumCacheTTL` is 14400 seconds (4 hours), where earlier versions used 60 seconds. Statically imported images are hashed by content and served with `Cache-Control: public, max-age=315360000, immutable`, so they are cached effectively forever. There is no built-in way to invalidate the cache, so keep `minimumCacheTTL` modest for images that change, or change the `src`.
+
+Some hosting platforms provide their own image optimization and cache instead of this built-in one. The behavior described here is that of the built-in optimizer.
+
+**How the `srcset` is really generated.**
+
+Which candidates the browser gets depends on the props:
+
+| Props | `srcset` |
+| --- | --- |
+| Fixed `width`, no `sizes` | Two candidates (1x and 2x): the nearest configured width at or above `width`, and at or above `2 x width` |
+| `sizes` present | A full list with width descriptors, from `deviceSizes` plus `imageSizes`, trimmed by the smallest percentage in `sizes` |
+| `fill`, no `sizes` | Treated as `sizes="100vw"`, so a full list |
+
+For `width={600}` with the defaults, the output looks like this (illustrative):
+
+```html
+<img
+  srcset="
+    /_next/image?url=%2Fproduct.jpg&w=640&q=75 1x,
+    /_next/image?url=%2Fproduct.jpg&w=1200&q=75 2x
+  "
+  src="/_next/image?url=%2Fproduct.jpg&w=1200&q=75"
+  width="600"
+  height="400"
+  loading="lazy"
+  decoding="async"
+  style="color: transparent"
+/>
+```
+
+The default `src` is the largest candidate and acts as the fallback for browsers without `srcset` support. The default widths are `deviceSizes: [640, 750, 828, 1080, 1200, 1920, 2048, 3840]` and, since Next.js 16, `imageSizes: [32, 48, 64, 96, 128, 256, 384]`. `imageSizes` only takes part when `sizes` is provided.
+
+**Format negotiation through the `Accept` header.**
+
+Every request to `/_next/image` carries the browser's `Accept` header, such as `image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8`. The optimizer compares it against the `formats` list in your configuration:
+
+```js
+// next.config.js
+module.exports = {
+  images: {
+    // The default is ['image/webp']. AVIF is opt-in and must come first to be preferred.
+    formats: ['image/avif', 'image/webp'],
+  },
+};
+```
+
+If the `Accept` header matches more than one configured format, the first one in the array wins, so order matters. If nothing matches, or the source is animated, the optimizer keeps the original image's format. The fallback is therefore the original, not always JPEG. The response carries `Vary: Accept`, so caches know that the same URL can return different bytes for different browsers. With multiple formats, each is cached separately, which needs more disk space. If you put a proxy or CDN in front of a self-hosted Next.js, it must forward the `Accept` header.
+
+The same URL can return WebP to one browser and the original JPEG to another because the format is negotiated per request, not per URL. That is why hard-coding a `.webp` URL is not equivalent.
+
+**How layout shift is prevented.**
+
+Next.js writes `width` and `height` as attributes on the `<img>` element. Browsers use those attributes to compute the image's aspect ratio before any pixels have loaded and reserve the space, so nothing moves when the image arrives. Next.js does not add an inline `aspect-ratio` style. This is why you must keep the aspect ratio when CSS resizes the image: setting `width: '100%'` without `height: 'auto'` can stretch it. Very old browsers (before Safari 15) do not derive the ratio from the attributes, and can still shift. With `fill`, the positioned parent supplies the box instead.
+
+**Configuration that matters for safety.**
+
+| Option | Default | Why it matters |
+| --- | --- | --- |
+| `remotePatterns` | none (remote images refused) | Limits which URLs the server will fetch |
+| `localPatterns` | any local path | Restricts which local paths can be optimized |
+| `qualities` | `[75]` (required in 16) | Limits the qualities an attacker can force you to generate |
+| `maximumRedirects` | 3 | Redirects are not re-checked against `remotePatterns` |
+| `maximumResponseBody` | 50 MB | Protects memory on small servers |
+| `dangerouslyAllowLocalIP` | false | Enabling it exposes internal network addresses to the fetcher |
+| `dangerouslyAllowSVG` | false | SVG can carry scripts |
+
+---
+
+### 7. Interview Traps
+
+<Question>
+**Trap 1: A developer adds `priority` (or `preload` in Next.js 16) to every image on the page "to make them all load faster." What is wrong with this?**
+</Question>
+
+<Answer>
+The prop tells the browser that an image is urgent: it removes lazy loading and, for `preload`, adds a `<link rel="preload">` to the `<head>` so the image is discovered before the rest of the page is parsed. Applied to every image, nothing is urgent any more. All the images are requested at once and compete for the same connection, and the one image that decides Largest Contentful Paint gets no advantage. It can even load later than it would have if only it had been prioritized.
+
+The web.dev guidance says this plainly: setting a high priority on more than one or two images makes priority setting unhelpful in reducing LCP. The correct use is one image, the largest above-the-fold image that is the likely LCP element. Everything else keeps the default `loading="lazy"`, so the browser spends its early bandwidth on what the user sees first, and fetches the rest as the user scrolls toward it.
+
+Two more points from the Next.js documentation. First, in Next.js 16 `priority` is deprecated in favor of `preload`, and in most cases `loading="eager"` or `fetchPriority="high"` is the better choice than `preload`. Second, avoid `preload` when different images can be the LCP element on different viewports (for example, a separate hero for mobile and desktop), because it would preload both.
+
+A useful heuristic: if you are not sure an image is visible without scrolling for most visitors, do not give it priority.
+</Answer>
+
+---
+
+<Question>
+**Trap 2: What happens if you use `next/image` with a remote image whose host is not covered by `remotePatterns`?**
+</Question>
+
+<Answer>
+The `/_next/image` endpoint refuses the request with `400 Bad Request`, and the image does not display.
+
+The restriction exists for security. The optimizer fetches URLs from your server. Without a list of allowed patterns, anyone could request `/_next/image?url=https://any-server.example/any-file` and use your server's bandwidth and compute to download and process arbitrary content, or point it at addresses inside your internal network. That is an open proxy and a server-side request forgery risk.
+
+The fix is to add a specific pattern to `remotePatterns` in `next.config.js`:
+
+```js
+remotePatterns: [
+  {
+    protocol: 'https',
+    hostname: 'specific-cdn.example.com',
+    port: '',
+    pathname: '/my-account/**',
+    search: '',
+  },
+],
+```
+
+Be as specific as you can. Omitting `pathname` allows every path on that host, and omitting `protocol`, `port`, or `search` implies the wildcard `**`. The documentation warns against relying on that. Also remember that redirects from an allowed host are followed without being checked against your patterns again, and that the old `domains` option cannot restrict protocol, port, or path, so it should not be used for new configuration.
+
+A common mistake during development is switching image providers, forgetting to update `remotePatterns`, and then assuming the component is broken because every image returns 400.
+</Answer>
+
+---
+
+<Question>
+**Trap 3: A developer replaces `<img>` with `<Image>` and sets `width={200}` and `height={200}` for a thumbnail. Later the thumbnail is made responsive with CSS (`width: 100%` inside a wide card) and it looks blurry. Why, and what fixes it?**
+</Question>
+
+<Answer>
+With `width={200}` and no `sizes`, Next.js generates a `srcset` with only 1x and 2x candidates: the nearest configured widths at or above 200 and above 400, which with the defaults are 256 and 640 pixels wide. Those descriptors describe pixel density, not layout width. With `1x` and `2x` descriptors, the browser chooses between the two candidates by screen density alone, and does not consider how wide the slot really is. When CSS then stretches the image to, say, 600 CSS pixels, the browser is still holding a 256 or 640 pixel file and scales it up.
+
+Note what is not the problem. `width` and `height` do not stop retina screens from getting a sharper image: the 2x candidate exists for exactly that reason. And they do not set the rendered size either, since CSS does.
+
+The fix is to tell Next.js how wide the image really is. Add a `sizes` prop that matches the layout (for example `sizes="(max-width: 768px) 100vw, 400px"`), and let CSS size the image with `width: '100%'` and `height: 'auto'`. Next.js then generates a full width-descriptor `srcset`, and the browser picks a candidate large enough for the actual slot and pixel density. For images that fill a container of unknown size, use `fill` with `sizes`.
+
+One more limit applies whatever the props: the optimizer can only resize what the source contains. If the original file is 200×200 pixels, no setting will make it sharp at 400 pixels. Use sources at least as large as the biggest size you will display, and preferably twice that for high density screens.
+</Answer>
+
+---
+
+### Self-Test
+
+<Question>
+**Q1.** Which four image performance problems does `next/image` address, which Core Web Vital does each one affect, and which parts still need input from the developer?
+</Question>
+
+<Answer>
+First, wrong dimensions for the display size. Oversized images waste bandwidth and delay the LCP image. `next/image` resizes on demand and generates a `srcset` so the browser can choose an appropriate candidate. It does this automatically for fixed-size images, but for responsive layouts you must supply `sizes`, otherwise the browser assumes `100vw`. Core Web Vital: LCP.
+
+Second, wrong format. Serving JPEG or PNG instead of a modern format sends more bytes and slows the LCP image. `next/image` negotiates the format from the `Accept` header, WebP by default, and AVIF if you enable it in `formats`. The developer only needs to decide whether to enable AVIF. Core Web Vital: LCP.
+
+Third, wrong loading priority. A lazy loaded LCP image is delayed by design, while eagerly loaded off-screen images steal bandwidth. `next/image` lazy loads every image by default, which handles the off-screen ones. It cannot know which image is the LCP element, so the developer marks that one with `loading="eager"`, `fetchPriority="high"`, or `preload` (`priority` before Next.js 16). Core Web Vital: LCP.
+
+Fourth, missing dimensions. Without them, the page shifts as images load. `next/image` requires `width` and `height` (or a static import, or `fill`) and renders them as attributes so the browser can reserve the space. Core Web Vital: CLS.
+
+Summarizing what remains manual: telling Next.js which image is the LCP image, describing responsive widths with `sizes`, and configuring `remotePatterns` for remote sources.
+</Answer>
+
+---
+
+<Question>
+**Q2.** How can the same `/_next/image` URL return WebP to one browser and the original format to another, and why does the `Vary: Accept` header matter?
+</Question>
+
+<Answer>
+The optimizer reads the `Accept` header of each incoming request. A current Chrome sends something like `image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8`. A browser that does not support WebP does not list `image/webp`. The optimizer compares the header against the configured `formats`, which default to `['image/webp']`, and uses the first configured format the header includes. If nothing matches, or the source is animated, it serves the original format. AVIF is only used if you add `image/avif` to `formats`.
+
+Because the same URL can return different bytes depending on a request header, the response includes `Vary: Accept`. That tells caches, including browsers and CDNs, to store separate entries per `Accept` value. Without it, a shared cache could store the WebP response and hand it to a browser that cannot display it. Two practical consequences follow. When several formats are enabled, each is cached separately, which takes more disk space. And a proxy or CDN in front of a self-hosted Next.js server must forward the `Accept` header, or the negotiation cannot work.
+</Answer>
+
+---
+
+<Question>
+**Q3.** A product page has a hero image above the fold and 20 product card images below the fold. Describe the best `next/image` setup for each group and explain why.
+</Question>
+
+<Answer>
+The hero image is almost certainly the LCP element, so it must not be lazy loaded and it should be fetched early. Use `loading="eager"` with `fetchPriority="high"`, or `preload` if it is the single clear LCP image on every viewport. In versions before Next.js 16, this is the `priority` prop. Give it `width` and `height` that match its intrinsic size, or use `fill` inside a positioned parent, and add `sizes` if its width changes with the viewport. Do not prioritize anything else. Giving more than one or two images high priority defeats the purpose.
+
+The product cards keep the default `loading="lazy"`, so the browser does not download them until they are within a calculated distance of the viewport. Chrome has used roughly 1250 pixels on fast connections and a larger distance on slow ones. That keeps the early bandwidth for the hero and the other above-the-fold resources, which improves LCP. Each card image still needs `width` and `height` (or `fill`) so it reserves space, and a `sizes` prop that describes the card width at each breakpoint, such as `sizes="(max-width: 768px) 100vw, (max-width: 1200px) 50vw, 33vw"`, so phones do not download desktop-sized files. `placeholder="blur"` with a small `blurDataURL` can improve perceived loading as users scroll.
+
+One caveat: on a large screen, the first row of cards may be above the fold. Lazy loading is fine there too, because images that are already in the viewport start loading immediately, but if a particular card is the LCP element on some layouts, treat it like the hero.
+</Answer>

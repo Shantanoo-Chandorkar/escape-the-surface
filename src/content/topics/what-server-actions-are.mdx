@@ -1,0 +1,656 @@
+---
+title: "What Server Actions are and what problem they solve"
+category: "nextjs"
+subcategory: "server-actions"
+order: 94
+---
+
+# What Server Actions Are and What Problem They Solve
+
+## Exploring what Server Actions are, the mutation problem they solve, and the security model behind them
+
+### 1. The Problem
+
+Every web application needs to mutate data. Users submit forms, update profiles, add items to carts, post comments, delete records. Before Server Actions, every mutation in a Next.js application needed the same boilerplate: write a React event handler, call `fetch` against an API route, write the API route handler, check the HTTP method, parse and validate the input, call the database, map failures to status codes, return a response, then read that response on the client and update the UI. For every single mutation.
+
+This is not just verbosity. It is a structural problem. Each mutation is split across two files (the client code and the API route) that communicate through a contract nobody enforces: a URL, an HTTP method, a JSON body shape, and a set of status codes. A form with five fields has five places in two files where the two halves can drift apart.
+
+Server Actions collapse this split. A Server Action is an async function marked with `'use server'` that runs on the server but can be invoked from the client like a local function call. Next.js generates the HTTP transport, serialization, and request checks. The event handler, the route handler, and the database call become one function you write and one call site you use.
+
+A note on terminology: React calls any async function that runs on the server and is callable from the client a **Server Function**. A **Server Action** is a Server Function used as an action, meaning it is passed to a form's `action` prop, a button's `formAction` prop, or called inside a transition. Next.js documentation uses both terms. In this lesson, "Server Action" is used for the mutation use case.
+
+---
+
+### 2. The Naive Attempt
+
+A developer builds a comment form using the pre-Server Actions pattern. The complete implementation for one simple feature:
+
+```
+File 1: components/CommentForm.jsx (client code)
+File 2: pages/api/comments.js (API route)
+```
+
+```jsx
+// components/CommentForm.jsx
+'use client';
+
+function CommentForm({ postId }) {
+  const [content, setContent] = React.useState('');
+  const [status, setStatus] = React.useState('idle');
+  const [error, setError] = React.useState(null);
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setStatus('loading');
+    setError(null);
+
+    try {
+      const response = await fetch('/api/comments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ postId, content }),
+      });
+
+      if (!response.ok) {
+        const data = await response.json();
+        throw new Error(data.error || 'Failed to post comment');
+      }
+
+      setContent('');
+      setStatus('success');
+    } catch (err) {
+      setError(err.message);
+      setStatus('error');
+    }
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <textarea
+        value={content}
+        onChange={(e) => setContent(e.target.value)}
+        placeholder="Write a comment..."
+      />
+      {error && <p className="error">{error}</p>}
+      <button type="submit" disabled={status === 'loading'}>
+        {status === 'loading' ? 'Posting...' : 'Post comment'}
+      </button>
+    </form>
+  );
+}
+```
+
+```js
+// pages/api/comments.js
+import { db } from '@/lib/database';
+import { getSession } from '@/lib/auth';
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  const session = await getSession(req);
+  if (!session) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const { postId, content } = req.body;
+
+  if (!content || content.trim().length === 0) {
+    return res.status(400).json({ error: 'Comment cannot be empty' });
+  }
+
+  if (content.length > 1000) {
+    return res.status(400).json({ error: 'Comment too long' });
+  }
+
+  try {
+    const comment = await db.comments.create({
+      data: {
+        postId,
+        content: content.trim(),
+        userId: session.userId,
+      },
+    });
+
+    return res.status(201).json({ comment });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to create comment' });
+  }
+}
+```
+
+This works. It is also the minimum viable implementation for posting a comment. Two files and roughly 80 lines. The client serializes the body by hand, the route parses it by hand, and both sides must agree on status codes and error shapes. Validation must live in the route because the client cannot be trusted. Error handling exists in two places. Loading state is managed manually.
+
+---
+
+### 3. Why That Breaks
+
+Four structural problems, not just verbosity.
+
+**Problem 1: Every mutation needs hand-built HTTP plumbing.**
+
+The route must check the HTTP method, parse the body, choose status codes, and shape error responses. Nothing about this is specific to posting a comment. If the route is a plain `route.js` or `pages/api` handler, protections such as CSRF defenses are also yours to design and remember. Each new mutation is a new chance to forget one.
+
+**Problem 2: The contract between two files is enforced by nobody.**
+
+The browser and the API route are both talking to the same server, so the number of network requests is the same either way. The cost is the contract. If the route renames `content` to `body`, or starts returning `422` instead of `400`, the client breaks at runtime with no compile-time warning. After the mutation succeeds, the client also has to refetch or patch its own copy of the data, which is usually a second request.
+
+**Problem 3: Manual loading and error state.**
+
+Every form needs `useState` for loading, error, and success. Every form writes the same `try/catch`, the same `setStatus('loading')` at the start, and the same `setStatus('error')` in the catch block. This is not logic. It is infrastructure that should be abstracted.
+
+**Problem 4: The JSON boundary carries no types.**
+
+The client sends JSON. The server receives an untyped object. TypeScript cannot verify that the shape the client sent matches what the route expects without additional tooling. With a Server Action, the function signature is shared, so the editor and the compiler see the same parameters on both sides. That is a compile-time benefit only. TypeScript annotations are not enforced at runtime, so the server must still validate every argument (more on this in section 5).
+
+---
+
+### 4. Next.js's Mental Model
+
+A Server Action is an async function defined with `'use server'` that Next.js turns into a callable reference on the client. From the developer's perspective, it is a function call. From the network's perspective, it is a `POST` request that Next.js builds, sends, and receives for you. The implementation never leaves the server. The client bundle only contains a reference to it.
+
+One sentence: a Server Action is a server-side function that the client can call like a local one, with Next.js handling the HTTP transport, so a mutation needs one function instead of a component plus an API route.
+
+One caveat belongs in the mental model from the start: the reference is not a private channel. Anyone who can send the same `POST` can call the action, so every Server Action is an entry point that must authenticate, authorize, and validate on its own. The framework adds protections, but it does not replace those checks.
+
+---
+
+### 5. Next.js's Solution
+
+**The `'use server'` directive.**
+
+`'use server'` marks async functions as Server Actions. Placed at the top of a file, it marks every export of that file. Placed at the top of a function body, it marks only that function. Only async functions can be exported from a `'use server'` file.
+
+```jsx
+// app/actions.js  <- dedicated actions file (required for Client Components to import from)
+'use server';
+
+import { db } from '@/lib/database';
+import { revalidatePath } from 'next/cache';
+import { getSession } from '@/lib/auth';
+
+export async function postComment(postId, content) {
+  const session = await getSession();
+  if (!session) throw new Error('Unauthorized');
+
+  // Arguments are client-controlled: TypeScript types do not exist at runtime
+  if (typeof postId !== 'string' || typeof content !== 'string') {
+    throw new Error('Invalid input');
+  }
+
+  const trimmedContent = content.trim();
+  if (trimmedContent.length === 0) return { error: 'Comment cannot be empty' };
+  if (trimmedContent.length > 1000) return { error: 'Comment too long' };
+
+  const comment = await db.comments.create({
+    data: {
+      postId,
+      content: trimmedContent,
+      userId: session.userId,
+    },
+  });
+
+  revalidatePath(`/posts/${postId}`); // invalidate the page's cache
+  return { id: comment.id }; // return what the UI needs, not the raw database record
+}
+```
+
+Notice the two kinds of failure. Missing session and malformed input are unexpected and are thrown. An empty or too-long comment is an expected outcome of normal use, so it is returned as a value. Section 7 explains why this split matters.
+
+```jsx
+// app/posts/[id]/CommentForm.jsx  <- Client Component
+'use client';
+
+import { postComment } from '@/app/actions';
+import { useState, useTransition } from 'react';
+
+function CommentForm({ postId }) {
+  const [content, setContent] = useState('');
+  const [errorMessage, setErrorMessage] = useState(null);
+  const [isPending, startTransition] = useTransition();
+
+  function handleSubmit(event) {
+    event.preventDefault();
+    setErrorMessage(null);
+
+    startTransition(async () => {
+      try {
+        const result = await postComment(postId, content);
+        if (result.error) {
+          setErrorMessage(result.error);
+          return;
+        }
+        setContent('');
+      } catch {
+        setErrorMessage('Something went wrong. Please try again.');
+      }
+    });
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <textarea value={content} onChange={(event) => setContent(event.target.value)} />
+      {errorMessage && <p>{errorMessage}</p>}
+      <button type="submit" disabled={isPending}>
+        {isPending ? 'Posting...' : 'Post comment'}
+      </button>
+    </form>
+  );
+}
+```
+
+One action file, one component file. The API route is gone. The database call is directly in the action, and the session check reads from the server environment without a `req` object. `useTransition` provides the pending flag, so there is no manual loading state to keep in sync.
+
+**Passing the action to a form's `action` prop.**
+
+React extends the HTML `<form>` element so that its `action` prop accepts a Server Action. The function automatically receives the browser's `FormData` object:
+
+```jsx
+// app/posts/[id]/CommentForm.jsx  <- Server Component (no 'use client')
+import { revalidatePath } from 'next/cache';
+import { db } from '@/lib/database';
+import { getSession } from '@/lib/auth';
+
+function CommentForm({ postId }) {
+  async function addComment(formData) {
+    'use server'; // inline Server Action, only allowed in Server Components
+    const session = await getSession();
+    if (!session) throw new Error('Unauthorized');
+
+    const content = String(formData.get('content') ?? '').trim();
+    if (content.length === 0 || content.length > 1000) return;
+
+    await db.comments.create({ data: { postId, content, userId: session.userId } });
+    revalidatePath(`/posts/${postId}`);
+  }
+
+  return (
+    <form action={addComment}>
+      <textarea name="content" placeholder="Write a comment..." />
+      <button type="submit">Post comment</button>
+    </form>
+  );
+}
+```
+
+Forms rendered by Server Components support progressive enhancement: the form can be submitted even if JavaScript has not loaded yet or is disabled. When JavaScript is available, React handles the submission without a full page reload. In a Client Component, a form that invokes a Server Action queues its submission until JavaScript loads, and that form is prioritized for hydration.
+
+Variables that an inline action captures from its surrounding scope (like `postId` above) are encrypted by Next.js before being sent to the client and back. Do not treat that as permission to capture secrets. Encryption is a safeguard, not a reason to close over sensitive values.
+
+**`useActionState` and `useFormStatus`.**
+
+Silently returning on invalid input, as `addComment` does above, is poor feedback. To show validation results, pair the action with React's `useActionState` hook. When an action is used this way, it receives the previous state as its first argument, before the `FormData`:
+
+```jsx
+// app/actions.js
+'use server';
+
+export async function addComment(postId, previousState, formData) {
+  const session = await getSession();
+  if (!session) throw new Error('Unauthorized');
+
+  const content = String(formData.get('content') ?? '').trim();
+  if (content.length === 0) return { error: 'Comment cannot be empty' };
+  if (content.length > 1000) return { error: 'Comment too long' };
+
+  try {
+    await db.comments.create({ data: { postId, content, userId: session.userId } });
+  } catch (error) {
+    console.error('Failed to create comment', { postId, userId: session.userId, error });
+    return { error: 'Failed to post comment' };
+  }
+
+  revalidatePath(`/posts/${postId}`);
+  return { success: true };
+}
+```
+
+```jsx
+// app/posts/[id]/CommentForm.jsx  <- Client Component
+'use client';
+
+import { useActionState } from 'react';
+import { useFormStatus } from 'react-dom';
+import { addComment } from '@/app/actions';
+
+function SubmitButton() {
+  const { pending } = useFormStatus();
+  // useFormStatus reads the pending state of the nearest parent form
+  return (
+    <button type="submit" disabled={pending}>
+      {pending ? 'Posting...' : 'Post comment'}
+    </button>
+  );
+}
+
+function CommentForm({ postId }) {
+  // bind fixes the first argument, so the action receives (postId, previousState, formData)
+  const [state, formAction] = useActionState(addComment.bind(null, postId), null);
+  // state: the return value of the last action call
+  // formAction: the action to pass to the form
+
+  return (
+    <form action={formAction}>
+      <textarea name="content" />
+      {state?.error && <p className="error">{state.error}</p>}
+      {state?.success && <p className="success">Comment posted!</p>}
+      <SubmitButton />
+    </form>
+  );
+}
+```
+
+`useActionState` replaces the manual `useState` for error and success. It returns a third value, `isPending`, so a single component can read the pending state directly. `useFormStatus` is the alternative when the submit button lives in a separate child component: it reports whether the nearest parent form is currently submitting. `useActionState` is imported from `react`. `useFormStatus` is imported from `react-dom`. The older name for `useActionState` was `useFormState`; new code should use `useActionState`.
+
+**Calling Server Actions outside forms.**
+
+Server Actions can also be called from event handlers in Client Components:
+
+```jsx
+'use client';
+
+import { useTransition } from 'react';
+import { deleteComment } from '@/app/actions';
+
+function CommentCard({ comment }) {
+  const [isPending, startTransition] = useTransition();
+
+  function handleDelete() {
+    startTransition(async () => {
+      await deleteComment(comment.id);
+    });
+  }
+
+  return (
+    <div>
+      <p>{comment.content}</p>
+      <button onClick={handleDelete} disabled={isPending}>
+        Delete
+      </button>
+    </div>
+  );
+}
+```
+
+```jsx
+// app/actions.js
+'use server';
+
+export async function deleteComment(commentId) {
+  const session = await getSession();
+  if (!session) throw new Error('Unauthorized');
+  if (typeof commentId !== 'string') throw new Error('Invalid input');
+
+  // Ownership check lives in the query: users can only delete their own comments
+  await db.comments.deleteMany({
+    where: { id: commentId, userId: session.userId },
+  });
+
+  revalidatePath('/posts/[id]', 'page'); // every cached post page may show this comment
+}
+```
+
+The pattern is the same everywhere: authenticate, validate the arguments, authorize against the specific resource, mutate, revalidate, and return only what the caller needs.
+
+---
+
+### 6. Internals
+
+**What Next.js does to a Server Action at build time.**
+
+When the compiler sees `'use server'`, it treats the function as a network-callable entry point. The implementation stays on the server. In client bundles, the function is replaced by a reference: an action ID plus a dispatcher that sends a request back to the server. Next.js encrypts action IDs and generates them non-deterministically, and it recalculates them periodically between builds. Unused Server Actions are removed from client bundles, so an action nothing references does not get a public endpoint.
+
+The actual implementation (`db.comments.create`, `getSession()`, `revalidatePath`) never appears in the client bundle.
+
+**What the request looks like.**
+
+Calling `postComment('42', 'Great post')` from the client produces a `POST` request to the URL of the page that hosts the action, not to a special endpoint. The action ID travels in the `Next-Action` request header. A simplified view:
+
+```
+POST /posts/42
+Next-Action: <encrypted action ID, illustrative>
+Origin: https://example.com
+
+["42","Great post"]
+```
+
+The body is encoded with React's Flight reply format, which is a superset of JSON. That is why arguments like `Date`, `Map`, `Set`, and `FormData` survive the trip while a plain JSON body would lose them. The response is also a Flight stream. It carries the action's return value and, when the action revalidated data, a freshly rendered payload for the current route.
+
+**How the server handles it.**
+
+Next.js receives the `POST`, reads the `Next-Action` header, resolves the ID to the exported function, deserializes the arguments, and runs it in that request. Several framework-level checks apply before your code runs:
+
+1. Only the `POST` method can invoke a Server Action. Actions are never invoked by `GET`, which removes a large class of CSRF problems.
+2. The request's `Origin` header is compared to the `Host` header (or `X-Forwarded-Host`). A mismatch is rejected. Behind proxies or CDNs, the `serverActions.allowedOrigins` option lists the extra trusted origins.
+3. The request body is capped at 1MB by default. `serverActions.bodySizeLimit` raises it.
+
+These checks are defense in depth. They do not decide whether this particular user may perform this particular mutation. That decision is always yours.
+
+**One response carries both data and UI.**
+
+When an action calls `revalidatePath`, `updateTag`, `refresh`, sets or deletes a cookie, or calls `redirect`, Next.js re-renders the relevant route on the server within the same HTTP request. The response carries the action's return value and the new UI together, so the client does not need a follow-up fetch. `redirect` throws a control-flow exception, so any code after it does not run: call `revalidatePath` before `redirect` when the destination needs fresh data. `revalidateTag` with a stale-while-revalidate profile is the exception: it marks data for background refresh and does not include an immediate re-render.
+
+**The client sends actions one at a time.**
+
+Next.js dispatches Server Actions sequentially per client. If a user triggers three actions in quick succession, the second waits for the first, and the third waits for the second. Do not use `Promise.all` to parallelize actions. This is one reason Server Actions are for mutations and not for reading data: reads belong in Server Components, where they can run in parallel and be cached.
+
+**Progressive enhancement, step by step.**
+
+When a `<form action={serverAction}>` is submitted before JavaScript has loaded, the browser sends a standard HTML form submission. In a Server Component the form works as long as the page HTML has arrived. In a Client Component the submission is queued and replayed, and the form is prioritized for hydration. After hydration, React intercepts submissions, calls the action through `fetch`, and updates the page without a full browser refresh. The form works either way.
+
+**Serialization of arguments and return values.**
+
+Arguments and return values cross the network boundary, so they must be serializable by React. Supported values include strings, numbers, booleans, `null`, `undefined`, `bigint`, arrays, plain objects, `Date`, `Map`, `Set`, typed arrays, `ArrayBuffer`, `FormData`, Promises, and Server Functions themselves. Not supported: plain functions, class instances, and React elements. Because return values are sent to the browser, return only what the UI needs and never a raw database record.
+
+**Deployment side effect: action IDs change.**
+
+Action IDs are part of a build's artifacts. A new deployment usually generates new IDs (Next.js rotates them at most every 14 days even when the source is unchanged). A browser tab still running the previous build can call an ID that no longer exists, and the failure surfaces as "Failed to find Server Action". Prefer rolling deployments, give the UI a retry path, and for self-hosted multi-instance setups set `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` so every instance uses the same key.
+
+---
+
+### 7. Interview Traps
+
+<Question>
+**Trap 1: A developer marks a utility function with `'use server'` to "make it run on the server." What security problem does this create?**
+
+```jsx
+'use server';
+
+export async function getAdminData() {
+  // This is an internal utility, only called by other server code
+  return await db.adminMetrics.findMany();
+}
+```
+</Question>
+
+<Answer>
+Marking a function with `'use server'` registers it as a Server Action, reachable through a direct `POST` request, not just through your UI. The function intended as an internal server utility is now a public entry point. Nothing in `getAdminData` checks who is calling it, so anyone who can obtain a valid action ID can retrieve all admin metrics.
+
+Next.js does help. Action IDs are encrypted and non-deterministic, and unused actions are removed from client bundles. But these are safeguards that reduce risk when an authentication layer is missing. They are not access control. An action that any client component references has an ID in the client bundle, and the documentation is explicit that you should still treat every Server Action as reachable by direct `POST`.
+
+The fix is not to use `'use server'` for internal server utilities at all. Server-only code that is not meant to be called from the client belongs in a regular server module, optionally marked with `import 'server-only'` so the build fails if a Client Component ever imports it. Call it directly from Server Components. Only functions that are legitimately meant to be invoked from the client as mutations should be Server Actions, and every one of them must authenticate, authorize, and validate its own arguments.
+</Answer>
+
+---
+
+<Question>
+**Trap 2: Can a Server Action mutate state and update the UI without `revalidatePath` or `revalidateTag`?**
+</Question>
+
+<Answer>
+Yes, for Client Component state. When a Client Component calls a Server Action, it can use the returned value to update its own local state with `useState`:
+
+```jsx
+'use client';
+
+function LikeButton({ postId, initialLikes }) {
+  const [likes, setLikes] = useState(initialLikes);
+
+  async function handleLike() {
+    const newCount = await likePost(postId); // Server Action returns the new count
+    setLikes(newCount); // updates local state directly
+  }
+
+  return <button onClick={handleLike}>{likes} likes</button>;
+}
+```
+
+The like count updates in this component as soon as the action returns. No cache invalidation is needed for that.
+
+However, this only updates this one component. Another component that shows the same count, such as a summary in a sidebar rendered by a Server Component, will keep showing the old value, and so will the next visit to the page if the server cache still holds the old output. For updates that must be consistent across the page or across visits, the action should call `revalidatePath` or `revalidateTag`. When an action calls `revalidatePath`, Next.js re-renders the current route on the server and sends the new UI in the same response as the action's return value. Client state for components that stay mounted is preserved. `revalidateTag` with a stale-while-revalidate profile is the exception: it schedules a background refresh and the action's own response does not include the new UI.
+
+The pattern: use local state for immediate feedback, and combine it with cache invalidation for consistency across the application.
+</Answer>
+
+---
+
+<Question>
+**Trap 3: A Server Action throws an error. What does the client receive, and how should errors be handled?**
+
+```jsx
+'use server';
+
+export async function deletePost(postId) {
+  const session = await getSession();
+  if (!session) throw new Error('Unauthorized');
+
+  await db.posts.deleteMany({ where: { id: postId, authorId: session.userId } });
+  revalidatePath('/posts');
+}
+```
+</Question>
+
+<Answer>
+When a Server Action throws, the client-side call rejects, so the calling code has to catch it. What the rejection contains depends on the environment. In development, the error message is sent to the client in plain text to help debugging. In production, React does not send the message or stack trace. It replaces the message with a generic one and sends a hash (a digest) that you can match against your server logs. So a `catch` block that shows `err.message` to the user works in development and silently shows something generic in production. Never rely on a thrown message reaching the UI, and never put sensitive details in one.
+
+Next.js splits errors into two categories. Expected errors are outcomes of normal operation, such as validation failures or a failed request to another service. Model these as return values, and read them with `useActionState`. Unexpected errors are bugs or conditions that should not happen. Throw these and let an error boundary (`error.js`) catch them. Errors thrown inside `startTransition` bubble up to the nearest error boundary if not caught.
+
+```jsx
+'use server';
+
+export async function deletePost(previousState, formData) {
+  const session = await getSession();
+  if (!session) return { error: 'Please sign in to delete posts' };
+
+  const postId = String(formData.get('postId') ?? '');
+
+  try {
+    const { count } = await db.posts.deleteMany({
+      where: { id: postId, authorId: session.userId },
+    });
+    if (count === 0) return { error: 'Post not found' };
+  } catch (error) {
+    console.error('Failed to delete post', { postId, userId: session.userId, error });
+    return { error: 'Failed to delete post' };
+  }
+
+  revalidatePath('/posts');
+  return { success: true };
+}
+```
+
+The error message returned here is written for the user. Details that help you debug (the database error, the user ID, the post ID) go to the server log, never into the returned object.
+</Answer>
+
+---
+
+### Self-Test
+
+<Question>
+**Q1.** What are the four structural problems with the API route pattern for mutations that Server Actions address?
+</Question>
+
+<Answer>
+First, hand-built HTTP plumbing. Every mutation needs a route that checks the method, parses the body, chooses status codes, and shapes errors, and it is easy to forget a protection such as a CSRF defense. Server Actions are always `POST`, come with an `Origin` versus `Host` check, and let you write the mutation as a plain function.
+
+Second, an unenforced contract between two files. The client and the route agree on a URL, a body shape, and status codes only by convention, and both talk to the same server, so the number of network requests is not the difference. What changes is that the mutation is one function, and because a single response can carry both the return value and a re-rendered route, the client often needs no follow-up fetch.
+
+Third, manual loading and error state. Each form repeats the same `useState` and `try/catch` infrastructure. With `useActionState`, `useFormStatus`, or `useTransition`, the pending and result state comes from React.
+
+Fourth, an untyped JSON boundary. A shared function signature gives compile-time types on both sides. It does not give runtime safety: arguments are client-controlled and TypeScript annotations are not enforced, so the action still has to validate its inputs.
+
+What Server Actions do not remove is the public entry point. An action is still reachable by direct `POST`, so it must authenticate, authorize, and validate inside itself.
+</Answer>
+
+---
+
+<Question>
+**Q2.** What is the difference between placing `'use server'` at the top of a file versus inside a function body?
+</Question>
+
+<Answer>
+Placing `'use server'` at the top of a file marks every export of that file as a Server Action. Every export must be an async function. This is the pattern for a dedicated actions file, and it is the only form Client Components can import from:
+
+```jsx
+// app/actions.js
+'use server';
+// ALL exports below are Server Actions
+export async function createPost(formData) { /* ... */ }
+export async function deletePost(postId) { /* ... */ }
+export async function updatePost(postId, formData) { /* ... */ }
+```
+
+Placing `'use server'` inside a function body marks only that function. This is used for inline Server Actions in Server Components, co-located with the form that uses them:
+
+```jsx
+// app/posts/page.js  <- Server Component (no 'use client')
+export default function PostsPage() {
+  async function createPost(formData) {
+    'use server'; // only this function is a Server Action
+    const session = await getSession();
+    if (!session) throw new Error('Unauthorized');
+
+    await db.posts.create({
+      data: { title: String(formData.get('title')), authorId: session.userId },
+    });
+    revalidatePath('/posts');
+  }
+
+  return (
+    <form action={createPost}>
+      <input name="title" />
+      <button type="submit">Create Post</button>
+    </form>
+  );
+}
+```
+
+Inline Server Actions cannot be defined in Client Components, and a `'use client'` file cannot contain a `'use server'` function. A Client Component that needs an action must import it from a file that has `'use server'` at the top, or receive it as a prop from a Server Component. Both forms create the same kind of entry point, so the same authentication, authorization, and validation rules apply to each.
+</Answer>
+
+---
+
+<Question>
+**Q3.** Why can Server Action arguments not include callback functions, and what does this mean for passing callbacks from Client Components to Server Actions?
+</Question>
+
+<Answer>
+Server Action arguments cross the client-server network boundary. They are serialized on the client and deserialized on the server. A regular JavaScript function is executable code with a closure and a scope chain, not data, so there is no way to send it over the network and have it run on the server. Only a small set of values can cross: primitives, arrays, plain objects, `Date`, `Map`, `Set`, `FormData`, Promises, and Server Functions themselves (as references). Plain functions and class instances cannot.
+
+This means a Client Component cannot pass a callback to a Server Action:
+
+```jsx
+// WRONG: passing a callback to a Server Action
+async function handleSubmit() {
+  await createPost(data, (result) => {
+    // This callback cannot cross the network boundary
+    setResult(result);
+  });
+}
+```
+
+The correct pattern is for the Server Action to return a value and for the client to handle it:
+
+```jsx
+// CORRECT: the Server Action returns data, the client handles it
+async function handleSubmit() {
+  const result = await createPost(data);
+  // result was returned from the server and deserialized on the client
+  setResult(result);
+}
+```
+
+For more complex coordination, the client calls the Server Action, receives a result, and uses its own state management to respond. The division of responsibility stays clear: the Server Action performs the server-side mutation and returns data, and the Client Component decides what the UI does with it.
+</Answer>
