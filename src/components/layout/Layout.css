@@ -17,6 +17,7 @@
 .layout-content {
   flex: 1;
   padding: 2rem;
+  padding-bottom: 0;
   overflow-y: auto;
   background-color: var(--surface-1);
 }
@@ -34,6 +35,85 @@
   background-color: var(--surface-2) !important;
   color: var(--text-color) !important;
   border: 1px solid var(--border-color);
+}
+
+/*
+ * Topic pager - sticky Previous/Next lesson bar, last child of .topic-container.
+ * Sized like a doc-site pagination card (Docusaurus's pagination-nav): bordered, not filled,
+ * so it reads as navigation chrome rather than a CTA banner competing with the article.
+ */
+.topic-pager {
+  position: sticky;
+  bottom: 0;
+  z-index: 10;
+  margin: 1.5rem -2rem -2rem;
+  padding: 0.75rem 2rem;
+  background-color: var(--surface-1);
+  border-top: 1px solid var(--border-color);
+}
+
+.topic-pager-inner {
+  display: flex;
+  gap: 0.75rem;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.topic-pager-link {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  flex: 0 1 260px;
+  min-width: 0;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border-color);
+  border-radius: 0.4rem;
+  text-decoration: none;
+  line-height: 1.25;
+  transition: border-color 0.15s ease;
+}
+
+.topic-pager-link:hover {
+  border-color: var(--primary-color);
+}
+
+.topic-pager-link--next {
+  margin-left: auto;
+  align-items: flex-end;
+  text-align: right;
+}
+
+.topic-pager-link:focus-visible {
+  outline: 2px solid var(--primary-color);
+  outline-offset: 1px;
+}
+
+.topic-pager-direction {
+  font-family: var(--font-sans);
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--primary-color);
+}
+
+.topic-pager-title {
+  font-family: var(--font-sans);
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text-color);
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.topic-pager-context {
+  font-family: var(--font-sans);
+  font-size: 0.6875rem;
+  color: var(--secondary-color);
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 /* Sidebar Styles - Rail Mode Support */
@@ -416,6 +496,34 @@
 @media (max-width: 1024px) {
   .layout-content {
     padding: 1rem;
+    padding-bottom: 0;
+  }
+
+  .topic-pager {
+    margin: 1.5rem -1rem -1rem;
+    padding: 0.75rem 1rem;
+  }
+
+  .topic-pager-inner {
+    gap: 0.5rem;
+  }
+
+  .topic-pager-link {
+    flex-basis: 0;
+    flex-grow: 1;
+    padding: 0.4rem 0.625rem;
+  }
+
+  .topic-pager-direction {
+    font-size: 0.6875rem;
+  }
+
+  .topic-pager-title {
+    font-size: 0.8125rem;
+  }
+
+  .topic-pager-context {
+    font-size: 0.6875rem;
   }
 
   .collapsible-sidebar {
