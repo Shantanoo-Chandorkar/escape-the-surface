@@ -1,0 +1,45 @@
+---
+/**
+ * TopicPager.astro - Previous/Next lesson links for a topic page.
+ *
+ * Neighbours come from getAdjacentTopics (topics.json order). Renders nothing when the slug has no
+ * neighbours, which covers unlisted topics that are not in topics.json.
+ *
+ * @prop {string} slug - Slug of the topic being viewed.
+ */
+import { getAdjacentTopics } from '../../utils/getAdjacentTopics';
+
+const { slug } = Astro.props;
+const { previous: previousTopic, next: nextTopic } = getAdjacentTopics(slug);
+---
+
+{
+    (previousTopic || nextTopic) && (
+        <nav class="topic-pager" aria-label="Lesson navigation">
+            <div class="topic-pager-inner">
+            {previousTopic && (
+                <a class="topic-pager-link topic-pager-link--previous" href={`/topic/${previousTopic.slug}`} rel="prev">
+                    <span class="topic-pager-direction">
+                        <span aria-hidden="true">&larr;</span> Previous
+                    </span>
+                    <span class="topic-pager-title">{previousTopic.title}</span>
+                    <span class="topic-pager-context">
+                        {previousTopic.categoryLabel} &middot; {previousTopic.subcategoryLabel}
+                    </span>
+                </a>
+            )}
+            {nextTopic && (
+                <a class="topic-pager-link topic-pager-link--next" href={`/topic/${nextTopic.slug}`} rel="next">
+                    <span class="topic-pager-direction">
+                        Next <span aria-hidden="true">&rarr;</span>
+                    </span>
+                    <span class="topic-pager-title">{nextTopic.title}</span>
+                    <span class="topic-pager-context">
+                        {nextTopic.categoryLabel} &middot; {nextTopic.subcategoryLabel}
+                    </span>
+                </a>
+            )}
+            </div>
+        </nav>
+    )
+}
