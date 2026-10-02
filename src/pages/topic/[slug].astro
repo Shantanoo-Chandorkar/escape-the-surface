@@ -10,7 +10,7 @@
  * old Netlify Edge Function used - except it happens once per slug during
  * `astro build` instead of on every request at the edge.
  */
-import { getCollection } from 'astro:content';
+import { getCollection, render } from 'astro:content';
 import MainLayout from '../../layouts/MainLayout.astro';
 import MDXComponents from '../../components/mdx/MDXComponents.jsx';
 import TopicPager from '../../components/layout/TopicPager.astro';
@@ -18,14 +18,14 @@ import TopicPager from '../../components/layout/TopicPager.astro';
 export async function getStaticPaths() {
     const topics = await getCollection('topics');
     return topics.map((topic) => ({
-        params: { slug: topic.slug },
+        params: { slug: topic.id },
         props: { topic },
     }));
 }
 
 const { topic } = Astro.props;
 const { slug } = Astro.params;
-const { Content } = await topic.render();
+const { Content } = await render(topic);
 
 // Build OG image URL at build time - replaces the Netlify Edge Function
 const EDGE_OG_BASE_URL = import.meta.env.VITE_EDGE_OG_BASE_URL ?? 'https://edge-og-xi.vercel.app';

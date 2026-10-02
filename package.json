@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.12"
   },
   "scripts": {
     "dev": "astro dev",
@@ -13,15 +13,18 @@
     "lint": "eslint . --report-unused-disable-directives --max-warnings 0",
     "format": "prettier --write .",
     "check-format": "prettier --check .",
-    "test": "vitest"
+    "test": "vitest",
+    "test:build": "npm run build && npm run test:dist",
+    "test:dist": "vitest run --config vitest.build.config.js",
+    "test:golden": "node tests/build/capture-golden.js"
   },
   "dependencies": {
-    "@astrojs/mdx": "^3.1.9",
-    "@astrojs/netlify": "^5.5.4",
+    "@astrojs/mdx": "^4.3.14",
+    "@astrojs/netlify": "^6.6.5",
     "@astrojs/react": "^4.4.2",
     "@heroicons/react": "^2.2.0",
     "@radix-ui/react-accordion": "^1.2.12",
-    "astro": "^4.16.18",
+    "astro": "^5.18.2",
     "fuse.js": "^7.2.0",
     "prop-types": "^15.8.1",
     "react": "^19.0.0",
@@ -44,6 +47,7 @@
     "eslint-plugin-react-refresh": "^0.4.19",
     "globals": "^16.0.0",
     "jsdom": "^29.0.1",
+    "node-html-parser": "^9.0.4",
     "prettier": "^3.8.1",
     "vitest": "^4.1.2"
   }
