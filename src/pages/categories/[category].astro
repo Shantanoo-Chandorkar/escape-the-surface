@@ -51,7 +51,7 @@ const pageTitle = `${categoryName} | EscapeTheSurface`;
                 <ul class="editorial-topic-list">
                     {subTopics.map((topic) => (
                         <li class="editorial-topic-row">
-                            <a href={`/topic/${topic.slug}`}>{topic.data.title}</a>
+                            <a href={`/topic/${topic.id}`}>{topic.data.title}</a>
                         </li>
                     ))}
                 </ul>
@@ -62,7 +62,7 @@ const pageTitle = `${categoryName} | EscapeTheSurface`;
             <ul class="editorial-topic-list">
                 {ungrouped.map((topic) => (
                     <li class="editorial-topic-row">
-                        <a href={`/topic/${topic.slug}`}>{topic.data.title}</a>
+                        <a href={`/topic/${topic.id}`}>{topic.data.title}</a>
                     </li>
                 ))}
             </ul>
