@@ -1,4 +1,5 @@
 import { defineCollection, z } from 'astro:content';
+import { glob } from 'astro/loaders';
 
 /**
  * Content Collection schema for all topic MDX files.
@@ -8,7 +9,7 @@ import { defineCollection, z } from 'astro:content';
  * which is the primary safety net the plan described.
  */
 const topics = defineCollection({
-    type: 'content',
+    loader: glob({ pattern: '**/*.mdx', base: './src/content/topics' }),
     schema: z.object({
         title: z.string(),
         category: z.string(),

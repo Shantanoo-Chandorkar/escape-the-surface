@@ -18,7 +18,7 @@ const FEATURED_SLUGS = [
     'server-and-client-components-and-data-fetching',
 ];
 const allTopics = await getCollection('topics');
-const featured = FEATURED_SLUGS.map((slug) => allTopics.find((topic) => topic.slug === slug)).filter(Boolean);
+const featured = FEATURED_SLUGS.map((slug) => allTopics.find((topic) => topic.id === slug)).filter(Boolean);
 
 const javascriptTopics = allTopics
     .filter((topic) => topic.data.category === 'javascript')
@@ -63,7 +63,7 @@ const firstLesson = javascriptTopics[0];
             <ul class="editorial-topic-list">
                 {featured.map((topic) => (
                     <li class="editorial-topic-row">
-                        <a href={`/topic/${topic.slug}`}>{topic.data.title}</a>
+                        <a href={`/topic/${topic.id}`}>{topic.data.title}</a>
                         <span class="editorial-topic-tag">
                             {categoryMeta[topic.data.category]?.name ?? formatTitle(topic.data.category)}
                         </span>

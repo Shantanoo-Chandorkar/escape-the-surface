@@ -35,5 +35,12 @@ export default [
       globals: globals.node,
     },
   },
+  {
+    // Build-output tests and their config run in Node and are never part of the shipped site.
+    files: ['tests/**/*.js', 'vitest.build.config.js'],
+    languageOptions: {
+      globals: globals.node,
+    },
+  },
   eslintConfigPrettier,
 ];
