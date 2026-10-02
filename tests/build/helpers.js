@@ -110,7 +110,10 @@ export function describePage(pagePath) {
   const pageRoot = readPage(pagePath);
   const contentRoot = pageRoot.querySelector('.mdx-content-wrapper');
   const codeBlocks = contentRoot?.querySelectorAll('pre') ?? [];
-  const codeText = codeBlocks.map((codeBlock) => codeBlock.textContent).join('\n');
+  // Astro 4 ended every code block with an invisible newline and Astro 5 does not, so it is not content.
+  const codeText = codeBlocks
+    .map((codeBlock) => readCodeBlockContents(codeBlock).textContent.trimEnd())
+    .join('\n');
   const visibleText = contentRoot ? readVisibleText(contentRoot) : '';
 
   return {
